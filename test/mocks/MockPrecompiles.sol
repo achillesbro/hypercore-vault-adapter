@@ -39,3 +39,15 @@ contract MockSpotBalance {
         return abi.encode(total, hold, entryNtl);
     }
 }
+
+contract MockL1Block {
+    uint64 internal blockNumber;
+
+    function set(uint64 _blockNumber) external {
+        blockNumber = _blockNumber;
+    }
+
+    fallback(bytes calldata) external returns (bytes memory) {
+        return abi.encode(blockNumber);
+    }
+}

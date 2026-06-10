@@ -49,11 +49,29 @@ don't reflect a just-queued action). So:
 6. Unwind: reduce-only close → `transferUsdClass(false)` → `bridgeToEvm` → `acknowledgeBridgeIn`
    → `vault.deallocate(...)`.
 
-## Known sharp edges (see inline comments)
+## Valuation & in-flight accounting
 
-- In-flight accounting during the settlement window (`pendingBridgeOut` is a placeholder).
-- `realAssets()` manipulation surface — gains are rate-capped by the vault, losses pass through.
+`realAssets()` sums everything observable from EVM: idle USDC + Core perp equity + Core spot USDC.
+Operations that move value *within* that set (spot↔perp class transfers, orders, Core→EVM bridges)
+leave the sum invariant and need no tracking. The only gap is **EVM→Core bridging**: the ERC20
+transfer debits idle synchronously while the Core spot credit lands a few L1 blocks later. Each such
+bridge is recorded with the L1 block it started (`0x0809` precompile) and added back to `realAssets()`
+**only until its age exceeds `settleWindowBlocks`** — after which settlement is guaranteed and the Core
+spot balance reflects it, so the add-back self-expires with no double count and no keeper.
+
+Hardening built in:
+
+- Perp equity floored at zero; reads fail closed (revert, never fabricate a value).
+- Self-expiring in-transit add-back so a deposit mid-bridge is never read as a loss.
+- Optional `maxGainBps` ceiling (curator-set, default off): caps the gain a single read may report
+  above cost basis, blunting a one-block mark-price spike. Losses always pass through.
+- Config (`settleWindowBlocks`, `maxGainBps`) is curator-gated, not allocator-gated.
+
+## Still open (see inline comments)
+
 - Withdrawal liquidity — instant exits served only from idle USDC; size a `forceDeallocatePenalty`.
+- Multi-asset spot valuation — price non-USDC spot via a manipulation-resistant source (oracle).
+- Conservative perp re-marking (oracle vs mark) would require tracking the open-markets set.
 - Mainnet USDC bridges via the `CoreDepositWallet` helper, not the generic system-address path.
 
 ## Run

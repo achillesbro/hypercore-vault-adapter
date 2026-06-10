@@ -15,9 +15,19 @@ import {Decimals} from "./libraries/Decimals.sol";
 ///        1. Funding   — allocate()/deallocate(), called only by the vault, move USDC vault <-> idle.
 ///        2. Trading   — allocator-gated functions that bridge, transfer margin, and place/cancel orders.
 ///      The vault's share price tracks the live position automatically via realAssets().
+///
+///      Valuation model. realAssets() sums everything observable from EVM:
+///        EVM idle USDC + Core perp equity + Core spot USDC + in-transit-to-Core.
+///      Operations that move value WITHIN that observable set (spot<->perp class transfers,
+///      orders, and even Core->EVM bridges) are invariant to the sum and need no tracking.
+///      The ONLY gap is EVM->Core bridging: the ERC20 transfer debits idle synchronously while
+///      the Core spot credit lands a few L1 blocks later. We add that amount back until the
+///      L1-block age proves settlement, so a deposit-in-flight is never read as a loss.
 contract HyperCoreAdapter is IAdapter {
     ICoreWriter internal constant CORE_WRITER =
         ICoreWriter(0x3333333333333333333333333333333333333333);
+
+    uint256 internal constant MAX_BPS = 10_000;
 
     address public immutable parentVault;
     address public immutable asset; // USDC on HyperEVM (the vault's underlying)
@@ -28,17 +38,40 @@ contract HyperCoreAdapter is IAdapter {
     uint32 public immutable perpDex; // perp dex index (0 = default)
     address public immutable usdcSystemAddress; // EVM system address used to bridge USDC
 
-    /// @dev USDC bridged Core->EVM but not yet credited on the EVM side. Keeps realAssets()
-    ///      from momentarily under-counting during the settlement window. Acknowledged by an
-    ///      allocator once the funds land. Production needs stronger reconciliation than this.
-    uint256 public pendingBridgeOut;
+    /// @dev EVM->Core bridges awaiting settlement. Appended in non-decreasing initL1Block order,
+    ///      so once we reach an entry within the settle window, every later one is too (ages
+    ///      decrease as index grows). `pendingHead` skips entries already proven settled.
+    struct PendingDeposit {
+        uint128 amount; // EVM USDC units in transit to Core
+        uint64 initL1Block; // L1 block at which the bridge was initiated
+    }
+
+    PendingDeposit[] internal pendingToCore;
+    uint256 public pendingHead;
+
+    /// @dev Conservative upper bound (in L1 blocks) on EVM->Core settlement latency. After this
+    ///      many blocks the Core spot balance is guaranteed to reflect the deposit, so the
+    ///      add-back is dropped to avoid double-counting. Curator-tunable.
+    uint64 public settleWindowBlocks;
+
+    /// @dev Net underlying the vault has entrusted (sum of allocate assets - deallocate assets).
+    ///      Cost basis used by the optional instantaneous gain ceiling.
+    uint256 public netDeposited;
+
+    /// @dev Defense-in-depth: caps the gain realAssets() may report above netDeposited in a single
+    ///      read, blunting a one-block mark-price spike. 0 = disabled. Losses always pass through.
+    ///      Complements (does not replace) the vault's time-based maxRate gain cap.
+    uint16 public maxGainBps;
 
     error NotVault();
     error NotAllocator();
+    error NotCurator();
     error InsufficientIdle();
 
     event ActionSent(bytes rawAction);
-    event BridgeAcknowledged(uint256 amount);
+    event BridgedToCore(uint256 amount, uint64 initL1Block);
+    event SettleWindowSet(uint64 blocks);
+    event MaxGainBpsSet(uint16 bps);
 
     modifier onlyVault() {
         if (msg.sender != parentVault) revert NotVault();
@@ -51,12 +84,20 @@ contract HyperCoreAdapter is IAdapter {
         _;
     }
 
+    /// @dev Config (risk params) is curator-gated, not allocator-gated. In production these should
+    ///      route through the vault's timelock; kept immediate here for the scaffold.
+    modifier onlyCurator() {
+        if (msg.sender != IVaultV2(parentVault).curator()) revert NotCurator();
+        _;
+    }
+
     constructor(
         address _parentVault,
         uint64 _usdcCoreToken,
         uint32 _usdcSpotIndex,
         uint32 _perpDex,
-        address _usdcSystemAddress
+        address _usdcSystemAddress,
+        uint64 _settleWindowBlocks
     ) {
         parentVault = _parentVault;
         asset = IVaultV2(_parentVault).asset();
@@ -64,9 +105,23 @@ contract HyperCoreAdapter is IAdapter {
         usdcSpotIndex = _usdcSpotIndex;
         perpDex = _perpDex;
         usdcSystemAddress = _usdcSystemAddress;
+        settleWindowBlocks = _settleWindowBlocks;
         adapterId = keccak256(abi.encode("this", address(this)));
         // Allow the vault to pull funds back during deallocate().
         IERC20(asset).approve(_parentVault, type(uint256).max);
+    }
+
+    /* ----------------------------- Config (curator-only) --------------------------- */
+
+    function setSettleWindowBlocks(uint64 blocks) external onlyCurator {
+        settleWindowBlocks = blocks;
+        emit SettleWindowSet(blocks);
+    }
+
+    function setMaxGainBps(uint16 bps) external onlyCurator {
+        require(bps <= MAX_BPS, "bps");
+        maxGainBps = bps;
+        emit MaxGainBpsSet(bps);
     }
 
     /* ----------------------------- Funding (vault-only) ----------------------------- */
@@ -78,6 +133,7 @@ contract HyperCoreAdapter is IAdapter {
     {
         // USDC has already been transferred in by the vault; it now sits idle until an
         // allocator bridges it to Core. Cap accounting books the inflow as exposure.
+        netDeposited += assets;
         return (ids(_market(data)), int256(assets));
     }
 
@@ -88,30 +144,31 @@ contract HyperCoreAdapter is IAdapter {
     {
         // Can only return USDC that an allocator has already bridged back to the EVM side.
         if (IERC20(asset).balanceOf(address(this)) < assets) revert InsufficientIdle();
+        netDeposited = assets >= netDeposited ? 0 : netDeposited - assets;
         return (ids(_market(data)), -int256(assets));
     }
 
     /* ----------------------------- Trading (allocator-gated) ------------------------ */
 
     /// @notice Bridge idle USDC from HyperEVM into this adapter's HyperCore spot account.
-    /// @dev Generic HIP-1 path: transfer to the token's EVM system address; Core credits on the
-    ///      Transfer event. Canonical USDC on mainnet routes via the CoreDepositWallet helper
-    ///      instead — swap this body for that call when wiring real addresses.
+    /// @dev The ERC20 transfer debits idle now; the Core spot credit lands later, so we record
+    ///      an in-transit entry that realAssets() adds back until settlement is proven by age.
+    ///      Generic HIP-1 path: transfer to the token's EVM system address; Core credits on the
+    ///      Transfer event. Canonical USDC on mainnet routes via the CoreDepositWallet helper.
     function bridgeToCore(uint256 usdcAmount) external onlyAllocator {
+        pruneSettled();
         _safeTransfer(asset, usdcSystemAddress, usdcAmount);
+        uint64 nowL1 = HyperCoreReader.l1BlockNumber();
+        pendingToCore.push(PendingDeposit({amount: uint128(usdcAmount), initL1Block: nowL1}));
+        emit BridgedToCore(usdcAmount, nowL1);
     }
 
     /// @notice Bridge USDC from the HyperCore spot account back to this adapter on HyperEVM.
+    /// @dev No in-transit tracking: at queue time the funds are still visible in Core spot, and on
+    ///      settlement Core spot drops while EVM idle rises together — the sum is invariant.
     function bridgeToEvm(uint256 usdcAmount) external onlyAllocator {
-        pendingBridgeOut += usdcAmount;
         uint64 amountWei = uint64(Decimals.evmToSpotWei(usdcAmount));
         _send(HyperCoreActions.spotSend(usdcSystemAddress, usdcCoreToken, amountWei));
-    }
-
-    /// @notice Decrement the in-flight counter once bridged-out USDC has landed in idle balance.
-    function acknowledgeBridgeIn(uint256 amount) external onlyAllocator {
-        pendingBridgeOut = amount >= pendingBridgeOut ? 0 : pendingBridgeOut - amount;
-        emit BridgeAcknowledged(amount);
     }
 
     /// @notice Move USD collateral between the spot and perp accounts on HyperCore.
@@ -140,11 +197,36 @@ contract HyperCoreAdapter is IAdapter {
     /* ----------------------------- Valuation --------------------------------------- */
 
     /// @inheritdoc IAdapter
-    /// @dev Conservative: floors perp equity at zero. Note the vault rate-caps gains, which
-    ///      blunts short-lived mark-price inflation; losses pass through to share price in full.
+    /// @dev Conservative: floors perp equity at zero, adds in-transit deposits so a bridge isn't
+    ///      read as a loss, and optionally caps single-read gains. Reads fail closed (revert)
+    ///      rather than fabricate a value — the vault freezes (liveness) but never misprices.
     function realAssets() public view returns (uint256) {
         uint256 idle = IERC20(asset).balanceOf(address(this));
-        return idle + _perpEquityEvm() + _usdcSpotEvm() + pendingBridgeOut;
+        uint256 observed = idle + _perpEquityEvm() + _usdcSpotEvm() + _inTransitToCore();
+        return _applyGainCeiling(observed);
+    }
+
+    /// @dev USDC still in transit EVM->Core whose settlement is not yet guaranteed by age.
+    function _inTransitToCore() internal view returns (uint256 total) {
+        uint64 current = HyperCoreReader.l1BlockNumber();
+        uint64 window = settleWindowBlocks;
+        uint256 n = pendingToCore.length;
+        for (uint256 i = pendingHead; i < n; i++) {
+            uint64 init = pendingToCore[i].initL1Block;
+            uint64 age = current >= init ? current - init : 0;
+            if (age <= window) {
+                // Entries are block-ordered, so every entry from here on is also within window.
+                for (uint256 j = i; j < n; j++) total += pendingToCore[j].amount;
+                return total;
+            }
+        }
+    }
+
+    function _applyGainCeiling(uint256 observed) internal view returns (uint256) {
+        uint16 bps = maxGainBps;
+        if (bps == 0 || netDeposited == 0) return observed;
+        uint256 ceiling = netDeposited + (netDeposited * bps) / MAX_BPS;
+        return observed > ceiling ? ceiling : observed;
     }
 
     function _perpEquityEvm() internal view returns (uint256) {
@@ -158,6 +240,31 @@ contract HyperCoreAdapter is IAdapter {
         HyperCoreReader.SpotBalance memory b =
             HyperCoreReader.spotBalance(address(this), usdcCoreToken);
         return Decimals.spotWeiToEvm(b.total);
+    }
+
+    /* ----------------------------- In-flight bookkeeping --------------------------- */
+
+    /// @notice Drop settled in-transit entries from the front. Permissionless; also called on
+    ///         each bridgeToCore so the pending set stays bounded by bridges-per-window.
+    function pruneSettled() public {
+        uint64 current = HyperCoreReader.l1BlockNumber();
+        uint64 window = settleWindowBlocks;
+        uint256 n = pendingToCore.length;
+        uint256 h = pendingHead;
+        while (h < n) {
+            uint64 init = pendingToCore[h].initL1Block;
+            if (current >= init && current - init > window) h++;
+            else break;
+        }
+        pendingHead = h;
+    }
+
+    function pendingToCoreLength() external view returns (uint256) {
+        return pendingToCore.length;
+    }
+
+    function inTransitToCore() external view returns (uint256) {
+        return _inTransitToCore();
     }
 
     /* ----------------------------- Risk ids ---------------------------------------- */

@@ -5,4 +5,5 @@ pragma solidity >=0.5.0;
 interface IVaultV2 {
     function asset() external view returns (address);
     function isAllocator(address account) external view returns (bool);
+    function curator() external view returns (address);
 }

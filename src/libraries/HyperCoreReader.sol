@@ -11,6 +11,7 @@ library HyperCoreReader {
     address internal constant MARK_PX = address(uint160(0x0806));
     address internal constant ORACLE_PX = address(uint160(0x0807));
     address internal constant SPOT_PX = address(uint160(0x0808));
+    address internal constant L1_BLOCK_NUMBER = address(uint160(0x0809));
     address internal constant ACCOUNT_MARGIN_SUMMARY = address(uint160(0x080f));
 
     struct SpotBalance {
@@ -51,6 +52,14 @@ library HyperCoreReader {
     function markPx(uint32 index) internal view returns (uint64) {
         (bool ok, bytes memory ret) = MARK_PX.staticcall(abi.encode(index));
         require(ok, "markPx precompile");
+        return abi.decode(ret, (uint64));
+    }
+
+    /// @dev Current HyperCore L1 block number. Used to age in-flight bridges so their value
+    ///      add-back self-expires once settlement is guaranteed.
+    function l1BlockNumber() internal view returns (uint64) {
+        (bool ok, bytes memory ret) = L1_BLOCK_NUMBER.staticcall(abi.encode());
+        require(ok, "l1BlockNumber precompile");
         return abi.decode(ret, (uint64));
     }
 }

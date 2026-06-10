@@ -8,10 +8,12 @@ import {IERC20} from "../../src/interfaces/IERC20.sol";
 ///      reads (asset, isAllocator) and replicates the push-then-call / call-then-pull flow.
 contract MockVaultV2 {
     address public asset;
+    address public curator;
     mapping(address => bool) public isAllocator;
 
-    constructor(address _asset) {
+    constructor(address _asset, address _curator) {
         asset = _asset;
+        curator = _curator;
     }
 
     function setAllocator(address account, bool value) external {
