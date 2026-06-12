@@ -159,7 +159,18 @@ contract HyperCoreAdapter is IAdapter {
     /* ----------------------------- Trading (allocator-gated) ------------------------ */
 
     /// @notice Bridge idle USDC from HyperEVM into this adapter's HyperCore spot account.
-    /// @dev Canonical mainnet USDC path: approve + CoreDepositWallet.deposit(amount, SPOT_DEX).
+    /// @dev WARNING — empirically BROKEN for contracts on TESTNET (2026-06-12, chainid 998):
+    ///      the Circle CoreDepositWallet silently refuses to credit smart-contract recipients.
+    ///      Observed: deposit() from this adapter and depositFor(adapter,...) from an EOA both
+    ///      succeed on EVM and emit the correct Transfer(from, systemAddress) event, but Core
+    ///      never credits (no ledger entry) and the USDC is absorbed with no refund path.
+    ///      Identical calldata with an EOA recipient credits within seconds (both dex routings).
+    ///      Plain ERC20 transfer to the USDC system address is not indexed at all.
+    ///      Contracts CAN hold Core USDC (Core-side spotSend credits them fine) — only this
+    ///      EVM->Core leg is blocked. Before mainnet: verify the mainnet wallet (different
+    ///      implementation) credits contracts, or redesign around a HIP-1 stable + Core spot swap.
+    ///
+    ///      Intended path: approve + CoreDepositWallet.deposit(amount, SPOT_DEX).
     ///      The deposit debits idle now; the Core spot credit lands later, so we record an
     ///      in-transit entry that realAssets() adds back until settlement is proven by age.
     function bridgeToCore(uint256 usdcAmount) external onlyAllocator {

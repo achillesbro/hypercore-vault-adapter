@@ -48,8 +48,13 @@ KEY_FILE = Path.home() / ".hypercore-testnet" / "deployer.json"
 
 import os
 
-VAULT = os.environ.get("VAULT", "")
-ADAPTER = os.environ.get("ADAPTER", "")
+from eth_utils import to_checksum_address
+
+def _cs(a):
+    return to_checksum_address(a) if a else ""
+
+VAULT = _cs(os.environ.get("VAULT", ""))
+ADAPTER = _cs(os.environ.get("ADAPTER", ""))
 
 
 def rpc(method, params):

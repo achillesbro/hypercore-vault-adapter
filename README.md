@@ -84,6 +84,40 @@ Hardening built in:
 - Conservative perp re-marking (oracle vs mark) would require tracking the open-markets set.
 - Mainnet USDC bridges via the `CoreDepositWallet` helper, not the generic system-address path.
 
+## Live testnet results (2026-06-12)
+
+Deployed and exercised on HyperEVM testnet (chainid 998):
+factory `0x17b98fdd6c04d2db38b4a67a463e50aab630a026`, vault
+`0x84ec0fca475d13a7fd3af55b752c584f9791171f`, adapter
+`0x67bc637af11b0d3ada30bbd1619530f21e40b550`.
+
+| Leg | Result |
+|---|---|
+| Deposit + allocate through the real VaultV2 | ✓ |
+| In-flight add-back held NAV during bridge window | ✓ (then correctly expired) |
+| EVM→Core USDC via Circle CoreDepositWallet, contract recipient | ✗ **silently not credited** (see below) |
+| Core-side spotSend of USDC/HYPE to the contract | ✓ |
+| `transferUsdClass` from the contract (CoreWriter action 7) | ✓ 42 USDC spot→perp |
+| `placeOrder` from the contract (action 1) | ✓ IOC filled 0.0002 BTC @ 64489 |
+| Reduce-only close from the contract | ✓ position flat, ~$0.01 round trip |
+| `realAssets()` via real precompiles tracking live position | ✓ vault `totalAssets()` matched throughout |
+| `bridgeToEvm` from the contract (action 13 sendAsset) | ✓ 40 USDC landed on EVM |
+| Deallocate + depositor withdraw at post-loss share price | ✓ |
+
+**The finding:** the Circle CoreDepositWallet (the only indexed EVM→Core path for USDC — plain
+ERC20 transfers to the system address are not indexed) refuses to credit smart-contract
+recipients: `deposit()` from the adapter and `depositFor(adapter, …)` from an EOA both emit the
+correct event but produce no Core ledger entry, and the USDC is absorbed without refund.
+Identical calls with an EOA recipient credit in seconds. Contracts hold and use Core USDC
+perfectly well once it arrives Core-side. Options before mainnet: (a) verify the mainnet wallet
+implementation (different bytecode) credits contracts with a $5 probe; (b) redesign funding
+around a HIP-1 stable (e.g. USDT0) whose linked-ERC20 system-address path is the generic
+mechanism, swapped to USDC on Core spot; (c) Core-native funding flows.
+
+It also empirically falsified the original "settlement guaranteed after N blocks" assumption —
+the in-transit add-back expired against a deposit that never settled, correctly realizing the
+loss rather than carrying phantom value indefinitely (the conservative failure mode).
+
 ## Testnet deployment runbook
 
 Verified testnet (chainid 998) constants: USDC ERC20 `0x2B3370eE501B4a559b57D449569354196457D8Ab`
