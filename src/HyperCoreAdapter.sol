@@ -226,9 +226,10 @@ contract HyperCoreAdapter is IAdapter {
 
     /// @dev USDC still in transit EVM->Core whose settlement is not yet guaranteed by age.
     function _inTransitToCore() internal view returns (uint256 total) {
+        uint256 n = pendingToCore.length;
+        if (pendingHead == n) return 0; // nothing pending: skip the precompile read
         uint64 current = HyperCoreReader.l1BlockNumber();
         uint64 window = settleWindowBlocks;
-        uint256 n = pendingToCore.length;
         for (uint256 i = pendingHead; i < n; i++) {
             uint64 init = pendingToCore[i].initL1Block;
             uint64 age = current >= init ? current - init : 0;

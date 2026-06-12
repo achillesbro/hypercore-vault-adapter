@@ -84,6 +84,36 @@ Hardening built in:
 - Conservative perp re-marking (oracle vs mark) would require tracking the open-markets set.
 - Mainnet USDC bridges via the `CoreDepositWallet` helper, not the generic system-address path.
 
+## Testnet deployment runbook
+
+Verified testnet (chainid 998) constants: USDC ERC20 `0x2B3370eE501B4a559b57D449569354196457D8Ab`
+(6 decimals), CoreDepositWallet `0x0B80659a4076E9E93C7DbE0f10675A16a3e5C206`
+(= `tokenInfo(0).evmContract`), same decimal seam as mainnet.
+
+Dedicated testnet deployer: `0x743312d068bd389930903ce182688E8d8E3F78DA`
+(key in `~/.hypercore-testnet/deployer.json` — testnet only, never fund on mainnet beyond activation).
+
+1. **Activation (one-time, human)** — the testnet faucet refuses addresses that don't exist on
+   mainnet. Send ~$5 USDC on Hyperliquid **mainnet** (Core-side send) to the deployer address,
+   then claim: `curl -X POST -H "Content-Type: application/json" -d
+   '{"type":"claimDrip","user":"0x743312d068bd389930903ce182688e8d8e3f78da"}'
+   https://api.hyperliquid-testnet.xyz/info` → 1000 mock USDC on testnet Core.
+2. Buy a little HYPE on testnet spot (API) and spot-send it to `0x2222...2222` to get native
+   gas on HyperEVM, and spot-send USDC to the EVM side for the deposit flow.
+3. `python3 script/flow/00_enable_big_blocks.py` — factory deployment needs ~15.7M gas
+   (measured), far over the 3M small block.
+4. `forge script script/DeployTestnet.s.sol --rpc-url https://rpc.hyperliquid-testnet.xyz/evm
+   --private-key ... --broadcast --slow` (simulation already passes against the live RPC).
+5. Disable big blocks again (`00_enable_big_blocks.py --off`), export `VAULT` / `ADAPTER`,
+   then drive the full cycle with `script/flow/flow.py` (deposit → allocate → bridge →
+   usd-class → trade → close → bridge-out → deallocate → withdraw) and verify Core-side
+   settlement with `script/flow/check_core_state.py <adapter>`.
+
+Note on trading UX: the adapter is a contract account — it cannot connect to the Hyperliquid
+web app (nothing can sign for it). Trading happens through EVM calls to the adapter
+(`flow.py trade ...`), while the HL explorer/portfolio pages work read-only for monitoring the
+adapter's positions.
+
 ## Run
 
 ```
