@@ -10,6 +10,11 @@ library HyperCoreActions {
     uint24 internal constant ACTION_SPOT_SEND = 6;
     uint24 internal constant ACTION_USD_CLASS_TRANSFER = 7;
     uint24 internal constant ACTION_CANCEL_BY_CLOID = 11;
+    uint24 internal constant ACTION_SEND_ASSET = 13;
+
+    // Dex identifiers used by sendAsset (verified against hyper-evm-lib HLConstants).
+    uint32 internal constant DEFAULT_PERP_DEX = 0;
+    uint32 internal constant SPOT_DEX = type(uint32).max;
 
     // Time-in-force codes for limit orders.
     uint8 internal constant TIF_ALO = 1; // add-liquidity-only (post-only)
@@ -53,5 +58,22 @@ library HyperCoreActions {
 
     function cancelByCloid(uint32 asset, uint128 cloid) internal pure returns (bytes memory) {
         return abi.encodePacked(ENCODING_VERSION, ACTION_CANCEL_BY_CLOID, abi.encode(asset, cloid));
+    }
+
+    /// @dev Canonical Core->EVM exit (and cross-dex moves): send to the token's EVM system
+    ///      address with sourceDex = destinationDex = SPOT_DEX. Mirrors hyper-evm-lib bridgeToEvm.
+    function sendAsset(
+        address destination,
+        address subAccount,
+        uint32 sourceDex,
+        uint32 destinationDex,
+        uint64 token,
+        uint64 amountWei
+    ) internal pure returns (bytes memory) {
+        return abi.encodePacked(
+            ENCODING_VERSION,
+            ACTION_SEND_ASSET,
+            abi.encode(destination, subAccount, sourceDex, destinationDex, token, amountWei)
+        );
     }
 }

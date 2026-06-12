@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity ^0.8.28;
 
-import {IAdapter} from "../../src/interfaces/IAdapter.sol";
-import {IERC20} from "../../src/interfaces/IERC20.sol";
+import {IAdapter} from "vault-v2/interfaces/IAdapter.sol";
+import {IERC20} from "vault-v2/interfaces/IERC20.sol";
 
-/// @dev Minimal stand-in for Morpho Vault v2: implements the IVaultV2 view surface the adapter
-///      reads (asset, isAllocator) and replicates the push-then-call / call-then-pull flow.
+/// @dev Minimal stand-in for Morpho Vault v2 used by the UNIT tests: implements the view surface
+///      the adapter reads (asset, isAllocator, curator) and replicates the push-then-call /
+///      call-then-pull flow. The FORK tests use the real VaultV2 instead.
 contract MockVaultV2 {
     address public asset;
     address public curator;

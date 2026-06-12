@@ -1,39 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity ^0.8.28;
 
+import {Test} from "forge-std/Test.sol";
+
 import {HyperCoreAdapter} from "../src/HyperCoreAdapter.sol";
 import {HyperCoreActions} from "../src/libraries/HyperCoreActions.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockVaultV2} from "./mocks/MockVaultV2.sol";
 import {MockCoreWriter} from "./mocks/MockCoreWriter.sol";
+import {MockDepositWallet} from "./mocks/MockDepositWallet.sol";
 import {MockAccountMargin, MockSpotBalance, MockL1Block} from "./mocks/MockPrecompiles.sol";
 
-interface Vm {
-    function etch(address target, bytes calldata code) external;
-    function prank(address sender) external;
-    function expectRevert(bytes4 selector) external;
-}
-
-/// @dev Minimal test base so the scaffold runs without an external forge-std dependency.
-contract MiniTest {
-    Vm internal constant vm = Vm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);
-
-    function assertEq(uint256 a, uint256 b) internal pure {
-        require(a == b, "assertEq(uint) failed");
-    }
-
-    function assertEq(int256 a, int256 b) internal pure {
-        require(a == b, "assertEq(int) failed");
-    }
-
-    function assertTrue(bool c) internal pure {
-        require(c, "assertTrue failed");
-    }
-}
-
-contract HyperCoreAdapterTest is MiniTest {
+contract HyperCoreAdapterTest is Test {
     MockERC20 usdc;
     MockVaultV2 vault;
+    MockDepositWallet depositWallet;
     HyperCoreAdapter adapter;
 
     address allocator = address(0xA11);
@@ -41,10 +22,9 @@ contract HyperCoreAdapterTest is MiniTest {
     address stranger = address(0xBAD);
 
     uint64 constant USDC_TOKEN = 0;
-    uint32 constant USDC_SPOT = 0;
     uint32 constant PERP_DEX = 0;
     uint64 constant SETTLE_WINDOW = 5; // L1 blocks
-    address constant USDC_SYS = address(uint160(0x2000)); // placeholder system address
+    address constant USDC_SYS = 0x2000000000000000000000000000000000000000;
 
     address constant CORE_WRITER = 0x3333333333333333333333333333333333333333;
     address constant SPOT_BALANCE = address(uint160(0x0801));
@@ -54,8 +34,10 @@ contract HyperCoreAdapterTest is MiniTest {
     function setUp() public {
         usdc = new MockERC20("USD Coin", "USDC", 6);
         vault = new MockVaultV2(address(usdc), curator);
-        adapter =
-            new HyperCoreAdapter(address(vault), USDC_TOKEN, USDC_SPOT, PERP_DEX, USDC_SYS, SETTLE_WINDOW);
+        depositWallet = new MockDepositWallet(address(usdc));
+        adapter = new HyperCoreAdapter(
+            address(vault), USDC_TOKEN, PERP_DEX, address(depositWallet), USDC_SYS, SETTLE_WINDOW
+        );
         vault.setAllocator(allocator, true);
 
         // Install the HyperCore system contract + precompiles at their canonical addresses.
@@ -128,6 +110,16 @@ contract HyperCoreAdapterTest is MiniTest {
 
     /* ----------------------------- In-flight accounting ---------------------------- */
 
+    function test_bridgeToCore_pullsViaDepositWalletWithSpotDex() public {
+        _allocate(100_000e6);
+
+        vm.prank(allocator);
+        adapter.bridgeToCore(100_000e6);
+
+        assertEq(usdc.balanceOf(address(depositWallet)), 100_000e6);
+        assertEq(depositWallet.lastDestinationDex(), type(uint32).max); // SPOT_DEX
+    }
+
     function test_bridgeToCore_inTransitPreservesValueDuringWindow() public {
         _allocate(100_000e6);
 
@@ -163,16 +155,13 @@ contract HyperCoreAdapterTest is MiniTest {
         vm.prank(allocator);
         adapter.bridgeToCore(100_000e6);
 
-        // Even if Core credits before the window elapses, the add-back is still active — but the
-        // sum is exact because idle already dropped: 0 idle + 100k spot + (window not elapsed)...
-        // This is the one transient over-count case the window bounds; we assert it is bounded to
-        // a single bridge amount and clears on expiry.
+        // If Core credits before the window elapses, the add-back transiently over-counts by at
+        // most the bridge size; it resolves exactly once the window passes.
         _setSpotBalance(100_000e6);
-        // mid-window: add-back (100k) + spot (100k) = 200k over-count, bounded by the bridge size.
-        assertEq(adapter.realAssets(), 200_000e6);
+        assertEq(adapter.realAssets(), 200_000e6); // bounded transient over-count
 
         _setL1Block(100 + SETTLE_WINDOW + 1);
-        assertEq(adapter.realAssets(), 100_000e6); // resolves exactly after the window
+        assertEq(adapter.realAssets(), 100_000e6); // exact after the window
     }
 
     function test_bridgeToEvm_doesNotDoubleCount() public {
@@ -187,6 +176,11 @@ contract HyperCoreAdapterTest is MiniTest {
         vm.prank(allocator);
         adapter.bridgeToEvm(100_000e6); // queued; Core spot still shows funds until settlement
         assertEq(adapter.realAssets(), 100_000e6); // unchanged — no phantom add-back
+
+        // Verify it queued a sendAsset (action 13) to the system address.
+        bytes memory a = MockCoreWriter(CORE_WRITER).lastAction();
+        assertEq(uint8(a[0]), 1);
+        assertEq(uint8(a[3]), 13);
     }
 
     function test_pruneSettled_advancesHead() public {
@@ -198,8 +192,7 @@ contract HyperCoreAdapterTest is MiniTest {
         adapter.bridgeToCore(100_000e6); // block 101
         assertEq(adapter.pendingToCoreLength(), 2);
 
-        // Advance well past the first entry's window; pruning drops only settled fronts.
-        _setL1Block(101 + SETTLE_WINDOW + 1); // entry@100 settled, entry@101 settled too here
+        _setL1Block(101 + SETTLE_WINDOW + 1); // both entries past their window here
         adapter.pruneSettled();
         assertEq(adapter.pendingHead(), 2);
         assertEq(adapter.inTransitToCore(), 0);
@@ -212,8 +205,7 @@ contract HyperCoreAdapterTest is MiniTest {
         vm.prank(curator);
         adapter.setMaxGainBps(1000); // allow at most +10% above cost basis
 
-        // Mark-price spike inflates perp equity to 200k.
-        _setPerpEquity(200_000e6);
+        _setPerpEquity(200_000e6); // mark-price spike
 
         // observed = 100k idle + 200k perp = 300k, clamped to 100k * 1.10 = 110k.
         assertEq(adapter.realAssets(), 110_000e6);
@@ -230,11 +222,10 @@ contract HyperCoreAdapterTest is MiniTest {
         vm.prank(curator);
         adapter.setMaxGainBps(1000);
 
-        // Idle bridged out then a loss on Core: only 70k equity remains.
         vm.prank(allocator);
         adapter.bridgeToCore(100_000e6);
         _setL1Block(100 + SETTLE_WINDOW + 1);
-        _setPerpEquity(70_000e6);
+        _setPerpEquity(70_000e6); // a loss on Core
 
         assertEq(adapter.realAssets(), 70_000e6); // loss not clamped
     }
@@ -258,10 +249,10 @@ contract HyperCoreAdapterTest is MiniTest {
         adapter.placeOrder(0, true, uint64(50_000e8), uint64(1e8), false, HyperCoreActions.TIF_GTC, 0);
 
         bytes memory a = MockCoreWriter(CORE_WRITER).lastAction();
-        assertEq(uint256(uint8(a[0])), 1); // encoding version
-        assertEq(uint256(uint8(a[1])), 0); // action id (uint24 big-endian) high byte
-        assertEq(uint256(uint8(a[2])), 0);
-        assertEq(uint256(uint8(a[3])), 1); // == ACTION_LIMIT_ORDER
+        assertEq(uint8(a[0]), 1); // encoding version
+        assertEq(uint8(a[1]), 0); // action id (uint24 big-endian) high byte
+        assertEq(uint8(a[2]), 0);
+        assertEq(uint8(a[3]), 1); // == ACTION_LIMIT_ORDER
         assertEq(MockCoreWriter(CORE_WRITER).actionsCount(), 1);
     }
 

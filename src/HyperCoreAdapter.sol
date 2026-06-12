@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity ^0.8.28;
 
-import {IAdapter} from "./interfaces/IAdapter.sol";
-import {IVaultV2} from "./interfaces/IVaultV2.sol";
+import {IAdapter} from "vault-v2/interfaces/IAdapter.sol";
+import {IVaultV2} from "vault-v2/interfaces/IVaultV2.sol";
+import {IERC20} from "vault-v2/interfaces/IERC20.sol";
 import {ICoreWriter} from "./interfaces/ICoreWriter.sol";
-import {IERC20} from "./interfaces/IERC20.sol";
+import {ICoreDepositWallet} from "./interfaces/ICoreDepositWallet.sol";
 import {HyperCoreActions} from "./libraries/HyperCoreActions.sol";
 import {HyperCoreReader} from "./libraries/HyperCoreReader.sol";
 import {Decimals} from "./libraries/Decimals.sol";
@@ -15,6 +16,13 @@ import {Decimals} from "./libraries/Decimals.sol";
 ///        1. Funding   — allocate()/deallocate(), called only by the vault, move USDC vault <-> idle.
 ///        2. Trading   — allocator-gated functions that bridge, transfer margin, and place/cancel orders.
 ///      The vault's share price tracks the live position automatically via realAssets().
+///
+///      Verified against HyperEVM mainnet (chainid 999):
+///        - USDC = Core token 0; ERC20 0xb88339CB7199b77E23DB6E890353E22632Ba630f (6 decimals).
+///        - EVM->Core USDC goes through CoreDepositWallet 0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24
+///          (the address tokenInfo(0).evmContract points to), via deposit(uint256,uint32).
+///        - Core->EVM uses sendAsset (action 13) to the token system address with SPOT_DEX legs.
+///        - Core spot wei = EVM USDC * 100 (tokenInfo: weiDecimals 8, evmExtraWeiDecimals -2).
 ///
 ///      Valuation model. realAssets() sums everything observable from EVM:
 ///        EVM idle USDC + Core perp equity + Core spot USDC + in-transit-to-Core.
@@ -33,10 +41,10 @@ contract HyperCoreAdapter is IAdapter {
     address public immutable asset; // USDC on HyperEVM (the vault's underlying)
     bytes32 public immutable adapterId;
 
-    uint64 public immutable usdcCoreToken; // HyperCore token index for USDC
-    uint32 public immutable usdcSpotIndex; // HyperCore spot pair index for USDC
+    uint64 public immutable usdcCoreToken; // HyperCore token index for USDC (0 on mainnet)
     uint32 public immutable perpDex; // perp dex index (0 = default)
-    address public immutable usdcSystemAddress; // EVM system address used to bridge USDC
+    address public immutable usdcDepositWallet; // CoreDepositWallet for EVM->Core USDC
+    address public immutable usdcSystemAddress; // token system address, Core->EVM destination
 
     /// @dev EVM->Core bridges awaiting settlement. Appended in non-decreasing initL1Block order,
     ///      so once we reach an entry within the settle window, every later one is too (ages
@@ -94,21 +102,21 @@ contract HyperCoreAdapter is IAdapter {
     constructor(
         address _parentVault,
         uint64 _usdcCoreToken,
-        uint32 _usdcSpotIndex,
         uint32 _perpDex,
+        address _usdcDepositWallet,
         address _usdcSystemAddress,
         uint64 _settleWindowBlocks
     ) {
         parentVault = _parentVault;
         asset = IVaultV2(_parentVault).asset();
         usdcCoreToken = _usdcCoreToken;
-        usdcSpotIndex = _usdcSpotIndex;
         perpDex = _perpDex;
+        usdcDepositWallet = _usdcDepositWallet;
         usdcSystemAddress = _usdcSystemAddress;
         settleWindowBlocks = _settleWindowBlocks;
         adapterId = keccak256(abi.encode("this", address(this)));
         // Allow the vault to pull funds back during deallocate().
-        IERC20(asset).approve(_parentVault, type(uint256).max);
+        require(IERC20(asset).approve(_parentVault, type(uint256).max), "approve");
     }
 
     /* ----------------------------- Config (curator-only) --------------------------- */
@@ -126,7 +134,7 @@ contract HyperCoreAdapter is IAdapter {
 
     /* ----------------------------- Funding (vault-only) ----------------------------- */
 
-    function allocate(bytes calldata data, uint256 assets, bytes4, address)
+    function allocate(bytes memory data, uint256 assets, bytes4, address)
         external
         onlyVault
         returns (bytes32[] memory, int256)
@@ -137,7 +145,7 @@ contract HyperCoreAdapter is IAdapter {
         return (ids(_market(data)), int256(assets));
     }
 
-    function deallocate(bytes calldata data, uint256 assets, bytes4, address)
+    function deallocate(bytes memory data, uint256 assets, bytes4, address)
         external
         onlyVault
         returns (bytes32[] memory, int256)
@@ -151,24 +159,34 @@ contract HyperCoreAdapter is IAdapter {
     /* ----------------------------- Trading (allocator-gated) ------------------------ */
 
     /// @notice Bridge idle USDC from HyperEVM into this adapter's HyperCore spot account.
-    /// @dev The ERC20 transfer debits idle now; the Core spot credit lands later, so we record
-    ///      an in-transit entry that realAssets() adds back until settlement is proven by age.
-    ///      Generic HIP-1 path: transfer to the token's EVM system address; Core credits on the
-    ///      Transfer event. Canonical USDC on mainnet routes via the CoreDepositWallet helper.
+    /// @dev Canonical mainnet USDC path: approve + CoreDepositWallet.deposit(amount, SPOT_DEX).
+    ///      The deposit debits idle now; the Core spot credit lands later, so we record an
+    ///      in-transit entry that realAssets() adds back until settlement is proven by age.
     function bridgeToCore(uint256 usdcAmount) external onlyAllocator {
         pruneSettled();
-        _safeTransfer(asset, usdcSystemAddress, usdcAmount);
+        require(IERC20(asset).approve(usdcDepositWallet, usdcAmount), "approve");
+        ICoreDepositWallet(usdcDepositWallet).deposit(usdcAmount, HyperCoreActions.SPOT_DEX);
         uint64 nowL1 = HyperCoreReader.l1BlockNumber();
         pendingToCore.push(PendingDeposit({amount: uint128(usdcAmount), initL1Block: nowL1}));
         emit BridgedToCore(usdcAmount, nowL1);
     }
 
     /// @notice Bridge USDC from the HyperCore spot account back to this adapter on HyperEVM.
-    /// @dev No in-transit tracking: at queue time the funds are still visible in Core spot, and on
-    ///      settlement Core spot drops while EVM idle rises together — the sum is invariant.
+    /// @dev sendAsset (action 13) to the token system address, both legs SPOT_DEX — mirrors
+    ///      hyper-evm-lib bridgeToEvm. No in-transit tracking: at queue time the funds are still
+    ///      visible in Core spot, and on settlement Core spot drops while EVM idle rises together.
     function bridgeToEvm(uint256 usdcAmount) external onlyAllocator {
         uint64 amountWei = uint64(Decimals.evmToSpotWei(usdcAmount));
-        _send(HyperCoreActions.spotSend(usdcSystemAddress, usdcCoreToken, amountWei));
+        _send(
+            HyperCoreActions.sendAsset(
+                usdcSystemAddress,
+                address(0),
+                HyperCoreActions.SPOT_DEX,
+                HyperCoreActions.SPOT_DEX,
+                usdcCoreToken,
+                amountWei
+            )
+        );
     }
 
     /// @notice Move USD collateral between the spot and perp accounts on HyperCore.
@@ -280,18 +298,12 @@ contract HyperCoreAdapter is IAdapter {
 
     /* ----------------------------- Internals --------------------------------------- */
 
-    function _market(bytes calldata data) internal pure returns (bytes32) {
+    function _market(bytes memory data) internal pure returns (bytes32) {
         return data.length == 0 ? bytes32(0) : abi.decode(data, (bytes32));
     }
 
     function _send(bytes memory rawAction) internal {
         CORE_WRITER.sendRawAction(rawAction);
         emit ActionSent(rawAction);
-    }
-
-    function _safeTransfer(address token, address to, uint256 amount) internal {
-        (bool ok, bytes memory ret) =
-            token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
-        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "transfer failed");
     }
 }
