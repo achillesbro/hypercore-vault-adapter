@@ -9,6 +9,7 @@ library HyperCoreActions {
     uint24 internal constant ACTION_LIMIT_ORDER = 1;
     uint24 internal constant ACTION_SPOT_SEND = 6;
     uint24 internal constant ACTION_USD_CLASS_TRANSFER = 7;
+    uint24 internal constant ACTION_ADD_API_WALLET = 9;
     uint24 internal constant ACTION_CANCEL_BY_CLOID = 11;
     uint24 internal constant ACTION_SEND_ASSET = 13;
 
@@ -58,6 +59,15 @@ library HyperCoreActions {
 
     function cancelByCloid(uint32 asset, uint128 cloid) internal pure returns (bytes memory) {
         return abi.encodePacked(ENCODING_VERSION, ACTION_CANCEL_BY_CLOID, abi.encode(asset, cloid));
+    }
+
+    /// @dev Authorize (or, with wallet=address(0), deregister) an API/agent wallet to TRADE this
+    ///      account's HyperCore positions. The agent can place/cancel orders but cannot withdraw
+    ///      or move funds. This is the on-chain equivalent of ApproveAgent — the only way a
+    ///      contract (which cannot produce an off-chain signature) can delegate trading.
+    ///      Payload matches the observed mainnet adapter: abi.encode(address wallet, string name).
+    function addApiWallet(address wallet, string memory name) internal pure returns (bytes memory) {
+        return abi.encodePacked(ENCODING_VERSION, ACTION_ADD_API_WALLET, abi.encode(wallet, name));
     }
 
     /// @dev Canonical Core->EVM exit (and cross-dex moves): send to the token's EVM system

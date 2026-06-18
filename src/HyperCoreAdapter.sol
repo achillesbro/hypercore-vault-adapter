@@ -80,6 +80,8 @@ contract HyperCoreAdapter is IAdapter {
     event BridgedToCore(uint256 amount, uint64 initL1Block);
     event SettleWindowSet(uint64 blocks);
     event MaxGainBpsSet(uint16 bps);
+    event ApiWalletApproved(address indexed agent, string name);
+    event ApiWalletRevoked(string name);
 
     modifier onlyVault() {
         if (msg.sender != parentVault) revert NotVault();
@@ -221,6 +223,42 @@ contract HyperCoreAdapter is IAdapter {
 
     function cancelOrder(uint32 coreAsset, uint128 cloid) external onlyAllocator {
         _send(HyperCoreActions.cancelByCloid(coreAsset, cloid));
+    }
+
+    /* ----------------------------- API / agent wallet ------------------------------ */
+
+    /// @notice The most recently approved agent (for transparency; events are the full record).
+    address public apiWallet;
+    string public apiWalletName;
+
+    /// @notice Authorize an off-chain agent wallet to TRADE this adapter's HyperCore account
+    ///         (place/cancel spot & perp orders) via Hyperliquid's API/SDK. Primary execution path.
+    /// @dev The agent CANNOT withdraw or move funds — getting USDC back to the vault still requires
+    ///      the allocator-gated bridge/deallocate functions. Approving an agent therefore delegates
+    ///      only the trading authority the allocator already holds, so it is allocator-gated.
+    ///      Once approved, the vault cannot veto the agent's individual trades on-chain — size the
+    ///      trust accordingly and use revokeApiWallet() (also curator-callable) as the kill switch.
+    function approveApiWallet(address agent, string calldata name) external onlyAllocator {
+        apiWallet = agent;
+        apiWalletName = name;
+        _send(HyperCoreActions.addApiWallet(agent, name));
+        emit ApiWalletApproved(agent, name);
+    }
+
+    /// @notice Deregister the agent wallet under `name`. Callable by an allocator OR the curator
+    ///         (curator gets an emergency kill switch independent of the allocator).
+    /// @dev Revocation by approving the zero address for the name — VERIFY semantics on testnet
+    ///      before relying on it as a security control.
+    function revokeApiWallet(string calldata name) external {
+        if (!IVaultV2(parentVault).isAllocator(msg.sender) && msg.sender != IVaultV2(parentVault).curator()) {
+            revert NotAllocator();
+        }
+        if (keccak256(bytes(name)) == keccak256(bytes(apiWalletName))) {
+            apiWallet = address(0);
+            apiWalletName = "";
+        }
+        _send(HyperCoreActions.addApiWallet(address(0), name));
+        emit ApiWalletRevoked(name);
     }
 
     /* ----------------------------- Valuation --------------------------------------- */

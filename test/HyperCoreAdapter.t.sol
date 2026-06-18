@@ -259,4 +259,62 @@ contract HyperCoreAdapterTest is Test {
     function test_spotAssetIdOffset() public pure {
         assertEq(uint256(HyperCoreActions.spotAssetId(5)), 10005);
     }
+
+    /* ----------------------------- API / agent wallet ------------------------------ */
+
+    address agent = address(0xA9E27);
+
+    function test_approveApiWallet_encodesAction9AndStores() public {
+        vm.prank(allocator);
+        adapter.approveApiWallet(agent, "strategy-1");
+
+        bytes memory a = MockCoreWriter(CORE_WRITER).lastAction();
+        assertEq(uint8(a[0]), 1); // version
+        assertEq(uint8(a[3]), 9); // == ACTION_ADD_API_WALLET
+        // payload = abi.encode(address agent, string name); first word is the agent address
+        // (4 header bytes, then 32-byte word).
+        address decoded;
+        assembly {
+            decoded := mload(add(a, 36))
+        }
+        assertEq(decoded, agent);
+        assertEq(adapter.apiWallet(), agent);
+        assertEq(adapter.apiWalletName(), "strategy-1");
+    }
+
+    function test_approveApiWallet_onlyAllocator() public {
+        vm.prank(stranger);
+        vm.expectRevert(HyperCoreAdapter.NotAllocator.selector);
+        adapter.approveApiWallet(agent, "x");
+    }
+
+    function test_revokeApiWallet_byAllocator_clearsAndEncodesZero() public {
+        vm.prank(allocator);
+        adapter.approveApiWallet(agent, "s");
+        vm.prank(allocator);
+        adapter.revokeApiWallet("s");
+
+        assertEq(adapter.apiWallet(), address(0));
+        bytes memory a = MockCoreWriter(CORE_WRITER).lastAction();
+        assertEq(uint8(a[3]), 9);
+        address decoded;
+        assembly {
+            decoded := mload(add(a, 36))
+        }
+        assertEq(decoded, address(0)); // zero address = deregister
+    }
+
+    function test_revokeApiWallet_byCurator_killSwitch() public {
+        vm.prank(allocator);
+        adapter.approveApiWallet(agent, "s");
+        vm.prank(curator); // curator can revoke even though it can't approve
+        adapter.revokeApiWallet("s");
+        assertEq(adapter.apiWallet(), address(0));
+    }
+
+    function test_revokeApiWallet_rejectsStranger() public {
+        vm.prank(stranger);
+        vm.expectRevert(HyperCoreAdapter.NotAllocator.selector);
+        adapter.revokeApiWallet("s");
+    }
 }

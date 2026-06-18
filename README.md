@@ -84,6 +84,31 @@ Hardening built in:
 - Conservative perp re-marking (oracle vs mark) would require tracking the open-markets set.
 - Mainnet USDC bridges via the `CoreDepositWallet` helper, not the generic system-address path.
 
+## Execution model: agent-wallet route (chosen)
+
+Trading is delegated to an off-chain **agent wallet** rather than placed on-chain. The adapter
+authorizes an agent via `approveApiWallet(agent, name)` (CoreWriter action 9 — the only way a
+contract, which can't sign off-chain, can delegate trading). The agent then places/cancels orders
+through Hyperliquid's normal API/SDK against the adapter's Core account. The agent **cannot
+withdraw or move funds** — only the allocator-gated bridge/deallocate paths can, so the agent's
+blast radius is bad trades, not theft. `revokeApiWallet(name)` (allocator or curator) is the kill
+switch. Fund movement (bridge, spot↔perp) stays on-chain in the adapter; only order execution is
+off-chain. On-chain `placeOrder`/`cancelOrder` remain as an optional fallback.
+
+Proven live on testnet (2026-06-12, adapter `0x5a71C5A4DA2c6B5B32B91ef2b83B2d4aC28bFF8e`):
+
+| Step | Result |
+|---|---|
+| `approveApiWallet` from the contract → CoreWriter action 9 | ✓ agent shows in `extraAgents`, valid ~1yr |
+| Agent (holding no funds) opens 0.0002 BTC via SDK, `account_address`=adapter | ✓ filled @ 62739 |
+| Position booked under the **adapter's** Core account | ✓ szi 0.0002, uPnL tracked |
+| `realAssets()` reflects it on-chain via real precompiles | ✓ ~$5.99 (mark/oracle spread vs API) |
+| Agent closes via SDK | ✓ filled @ 62769 |
+| `revokeApiWallet` from the contract (approve zero address) | ✓ `extraAgents` empties |
+| Agent trade attempt after revoke | ✓ rejected: "API Wallet does not exist" |
+
+Operator tooling: `script/flow/agent_trade.py` (open/close/status via the SDK as the agent).
+
 ## Live testnet results (2026-06-12)
 
 Deployed and exercised on HyperEVM testnet (chainid 998):
