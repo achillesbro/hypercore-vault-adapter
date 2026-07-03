@@ -12,6 +12,7 @@ library HyperCoreReader {
     address internal constant ORACLE_PX = address(uint160(0x0807));
     address internal constant SPOT_PX = address(uint160(0x0808));
     address internal constant L1_BLOCK_NUMBER = address(uint160(0x0809));
+    address internal constant BBO = address(uint160(0x080e));
     address internal constant ACCOUNT_MARGIN_SUMMARY = address(uint160(0x080f));
     address internal constant CORE_USER_EXISTS = address(uint160(0x0810));
 
@@ -62,6 +63,14 @@ library HyperCoreReader {
         (bool ok, bytes memory ret) = L1_BLOCK_NUMBER.staticcall(abi.encode());
         require(ok, "l1BlockNumber precompile");
         return abi.decode(ret, (uint64));
+    }
+
+    /// @dev Best bid/offer for a spot or perp asset (spot: 10000 + pair index). Raw prices are
+    ///      human px * 10^(8 - baseSzDecimals) — verified against the live book for pair 166.
+    function bbo(uint32 asset) internal view returns (uint64 bid, uint64 ask) {
+        (bool ok, bytes memory ret) = BBO.staticcall(abi.encode(asset));
+        require(ok, "bbo precompile");
+        return abi.decode(ret, (uint64, uint64));
     }
 
     /// @dev Whether `user` has an account on HyperCore. Bridged HIP-1 funds sent to a

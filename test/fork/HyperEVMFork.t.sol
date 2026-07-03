@@ -10,7 +10,7 @@ import {IERC20} from "vault-v2/interfaces/IERC20.sol";
 
 import {HyperCoreAdapter} from "../../src/HyperCoreAdapter.sol";
 import {HyperCoreActions} from "../../src/libraries/HyperCoreActions.sol";
-import {MockAccountMargin, MockSpotBalance, MockL1Block, MockCoreUserExists} from "../mocks/MockPrecompiles.sol";
+import {MockAccountMargin, MockSpotBalance, MockL1Block, MockCoreUserExists, MockBbo} from "../mocks/MockPrecompiles.sol";
 
 /// @title HyperEVM mainnet fork test
 /// @notice Runs against a fork of HyperEVM (chainid 999) with REAL contracts: the real Morpho
@@ -43,6 +43,7 @@ contract HyperEVMForkTest is Test {
     address constant L1_BLOCK_PC = address(uint160(0x0809));
     address constant ACCOUNT_MARGIN_PC = address(uint160(0x080f));
     address constant CORE_USER_EXISTS_PC = address(uint160(0x0810));
+    address constant BBO_PC = address(uint160(0x080e));
 
     uint64 constant TRANSIT_TOKEN = 268; // USDT0 Core token index (verified via spotMeta)
     int8 constant TRANSIT_EXTRA = -2; // verified: wei = evm * 100
@@ -75,7 +76,8 @@ contract HyperEVMForkTest is Test {
         vault.setIsAllocator(allocator, true);
 
         adapter = new HyperCoreAdapter(
-            address(vault), TRANSIT_TOKEN, USDT0_SYSTEM, TRANSIT_EXTRA, PERP_DEX, SETTLE_WINDOW
+            address(vault), TRANSIT_TOKEN, USDT0_SYSTEM, TRANSIT_EXTRA, PERP_DEX, SETTLE_WINDOW,
+            10166, 1e6, false // USDT0/USDC pair 166; 6-dec underlying, pxDivisor 1e6
         );
 
         vm.prank(curator);
@@ -91,6 +93,8 @@ contract HyperEVMForkTest is Test {
         vm.etch(SPOT_BALANCE_PC, address(new MockSpotBalance()).code);
         vm.etch(L1_BLOCK_PC, address(new MockL1Block()).code);
         vm.etch(CORE_USER_EXISTS_PC, address(new MockCoreUserExists()).code);
+        vm.etch(BBO_PC, address(new MockBbo()).code);
+        MockBbo(BBO_PC).set(1e6, 1e6);
         MockL1Block(L1_BLOCK_PC).set(1000);
         MockCoreUserExists(CORE_USER_EXISTS_PC).set(true);
 

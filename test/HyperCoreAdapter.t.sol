@@ -6,9 +6,10 @@ import {Test} from "forge-std/Test.sol";
 import {HyperCoreAdapter} from "../src/HyperCoreAdapter.sol";
 import {HyperCoreActions} from "../src/libraries/HyperCoreActions.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {MockWrappedNative} from "./mocks/MockWrappedNative.sol";
 import {MockVaultV2} from "./mocks/MockVaultV2.sol";
 import {MockCoreWriter} from "./mocks/MockCoreWriter.sol";
-import {MockAccountMargin, MockSpotBalance, MockL1Block, MockCoreUserExists} from "./mocks/MockPrecompiles.sol";
+import {MockAccountMargin, MockSpotBalance, MockL1Block, MockCoreUserExists, MockBbo} from "./mocks/MockPrecompiles.sol";
 
 contract HyperCoreAdapterTest is Test {
     MockERC20 usdt0; // the underlying: a HIP-1 stable with a linked ERC20 (USDT0-style)
@@ -31,12 +32,17 @@ contract HyperCoreAdapterTest is Test {
     address constant L1_BLOCK = address(uint160(0x0809));
     address constant ACCOUNT_MARGIN = address(uint160(0x080f));
     address constant CORE_USER_EXISTS = address(uint160(0x0810));
+    address constant BBO = address(uint160(0x080e));
+
+    uint32 constant SPOT_ASSET = 10166; // underlying/USDC pair asset id
+    uint256 constant USD_SCALE = 1e6; // 6-dec underlying, pxDivisor 1e6
 
     function setUp() public {
         usdt0 = new MockERC20("USDT0", "USDT0", 6);
         vault = new MockVaultV2(address(usdt0), curator);
         adapter = new HyperCoreAdapter(
-            address(vault), TRANSIT_TOKEN, TRANSIT_SYS, TRANSIT_EXTRA, PERP_DEX, SETTLE_WINDOW
+            address(vault), TRANSIT_TOKEN, TRANSIT_SYS, TRANSIT_EXTRA, PERP_DEX, SETTLE_WINDOW,
+            SPOT_ASSET, USD_SCALE, false
         );
         vault.setAllocator(allocator, true);
 
@@ -46,6 +52,8 @@ contract HyperCoreAdapterTest is Test {
         vm.etch(SPOT_BALANCE, address(new MockSpotBalance()).code);
         vm.etch(L1_BLOCK, address(new MockL1Block()).code);
         vm.etch(CORE_USER_EXISTS, address(new MockCoreUserExists()).code);
+        vm.etch(BBO, address(new MockBbo()).code);
+        MockBbo(BBO).set(1e6, 1e6); // underlying/USDC at exactly 1.0 => USD counts 1:1
         _setL1Block(100);
         MockCoreUserExists(CORE_USER_EXISTS).set(true); // adapter Core account exists by default
 
@@ -354,5 +362,64 @@ contract HyperCoreAdapterTest is Test {
         vm.prank(stranger);
         vm.expectRevert(HyperCoreAdapter.NotAllocator.selector);
         adapter.revokeApiWallet("s");
+    }
+
+    /* ----------------------------- Priced valuation -------------------------------- */
+
+    function test_realAssets_pricesUsdViaBboAsk() public {
+        // USDC-side value must be converted at the book ask (conservative), not 1:1.
+        _setPerpEquity(100e6); // $100 of perp equity
+        MockBbo(BBO).set(990000, 1_010000); // underlying trading at 0.99 / 1.01 vs USDC
+
+        // $100 * 1e6 / 1.01e6 = 99.0099 underlying units
+        assertEq(adapter.realAssets(), uint256(100e6) * 1e6 / 1_010000);
+    }
+
+    function test_realAssets_revertsOnEmptyBook() public {
+        _setPerpEquity(100e6);
+        MockBbo(BBO).set(0, 0); // no ask: fail closed rather than misprice
+        vm.expectRevert(bytes("no ask"));
+        adapter.realAssets();
+    }
+
+    /* ----------------------------- Native (WHYPE) underlying ----------------------- */
+
+    function test_bridgeToCore_nativeUnwrapsAndSendsValue() public {
+        MockWrappedNative whype = new MockWrappedNative();
+        vm.deal(address(whype), 100 ether); // backing for withdrawals
+        MockVaultV2 hypeVault = new MockVaultV2(address(whype), curator);
+        address hypeSystem = 0x2222222222222222222222222222222222222222;
+        HyperCoreAdapter hypeAdapter = new HyperCoreAdapter(
+            address(hypeVault), 150, hypeSystem, 10, PERP_DEX, SETTLE_WINDOW, 10107, 1e18, true
+        );
+        hypeVault.setAllocator(allocator, true);
+        whype.mint(address(hypeVault), 10 ether);
+        vm.prank(allocator);
+        hypeVault.allocate(address(hypeAdapter), abi.encode(bytes32("HYPE")), 10 ether);
+
+        vm.prank(allocator);
+        hypeAdapter.bridgeToCore(10 ether);
+
+        // WHYPE unwrapped, native value sent to the HYPE system address.
+        assertEq(whype.balanceOf(address(hypeAdapter)), 0);
+        assertEq(hypeSystem.balance, 10 ether);
+        assertEq(hypeAdapter.inTransitToCore(), 10 ether);
+        assertEq(hypeAdapter.realAssets(), 10 ether); // add-back holds NAV
+    }
+
+    function test_wrapNative_countsArrivalsEitherWay() public {
+        MockWrappedNative whype = new MockWrappedNative();
+        MockVaultV2 hypeVault = new MockVaultV2(address(whype), curator);
+        HyperCoreAdapter hypeAdapter = new HyperCoreAdapter(
+            address(hypeVault), 150, 0x2222222222222222222222222222222222222222, 10,
+            PERP_DEX, SETTLE_WINDOW, 10107, 1e18, true
+        );
+        // Core->EVM arrival lands as native: counted pre-wrap and post-wrap identically.
+        vm.deal(address(hypeAdapter), 3 ether);
+        assertEq(hypeAdapter.realAssets(), 3 ether);
+        hypeAdapter.wrapNative();
+        assertEq(address(hypeAdapter).balance, 0);
+        assertEq(whype.balanceOf(address(hypeAdapter)), 3 ether);
+        assertEq(hypeAdapter.realAssets(), 3 ether);
     }
 }

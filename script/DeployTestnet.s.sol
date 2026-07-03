@@ -57,7 +57,8 @@ contract DeployTestnet is Script {
         vault.setMaxRate(uint256(200e16) / uint256(365 days));
 
         HyperCoreAdapter adapter = new HyperCoreAdapter(
-            address(vault), TRANSIT_TOKEN, TRANSIT_SYSTEM, TRANSIT_EXTRA, PERP_DEX, SETTLE_WINDOW
+            address(vault), TRANSIT_TOKEN, TRANSIT_SYSTEM, TRANSIT_EXTRA, PERP_DEX, SETTLE_WINDOW,
+            10000, 1e6, false // testnet: PURR/USDC pair 0 placeholder for pricing; verify per deploy
         );
 
         vault.submit(abi.encodeCall(IVaultV2.addAdapter, (address(adapter))));

@@ -9,6 +9,12 @@ import {HyperCoreActions} from "./libraries/HyperCoreActions.sol";
 import {HyperCoreReader} from "./libraries/HyperCoreReader.sol";
 import {Decimals} from "./libraries/Decimals.sol";
 
+/// @dev WETH9-style wrapped-native interface (WHYPE at 0x5555...5555 on HyperEVM mainnet).
+interface IWrappedNative {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
 /// @title HyperCoreAdapter
 /// @notice Morpho Vault v2 adapter that trades spot & perps on HyperCore (Hyperliquid L1) from HyperEVM.
 /// @dev Two surfaces, deliberately split because HyperCore settles asynchronously:
@@ -56,11 +62,23 @@ contract HyperCoreAdapter is IAdapter {
     bytes32 public immutable adapterId;
 
     uint64 public immutable transitCoreToken; // Core token index of the underlying
-    address public immutable transitSystemAddress; // 0x2000...0 + transitCoreToken
+    address public immutable transitSystemAddress; // 0x2000...0 + index (HYPE: 0x2222...2222)
     /// @dev tokenInfo(transitCoreToken).evmExtraWeiDecimals: evm = wei * 10^extra.
     ///      USDT0/USDC-style tokens: -2 (wei = evm * 100). Verified per token before deploy.
     int8 public immutable transitEvmExtraWeiDecimals;
     uint32 public immutable perpDex; // perp dex index (0 = default)
+
+    /// @dev Spot asset id (10000 + pair index) of the UNDERLYING/USDC pair, used to price
+    ///      USD-denominated Core value (perp equity, spot USDC) in underlying units.
+    ///      USDT0: 10166, HYPE: 10107, UBTC: 10142 (mainnet, verified).
+    uint32 public immutable underlyingSpotAsset;
+    /// @dev usdToUnderlyingScale = pxDivisor * 10^(underlyingEvmDecimals - 6), where
+    ///      pxDivisor = 10^(8 - baseSzDecimals) (bbo raw px scaling, verified on-chain).
+    ///      USDT0: 1e6, WHYPE: 1e18, UBTC: 1e5. underlying = usd6 * scale / rawAskPx.
+    uint256 public immutable usdToUnderlyingScale;
+    /// @dev True when the underlying is wrapped-native (WHYPE): bridging unwraps and sends
+    ///      native value to the system address; Core->EVM arrivals come back as native.
+    bool public immutable isNativeUnderlying;
 
     /// @dev EVM->Core bridges awaiting settlement. Appended in non-decreasing initL1Block order,
     ///      so once we reach an entry within the settle window, every later one is too (ages
@@ -124,7 +142,10 @@ contract HyperCoreAdapter is IAdapter {
         address _transitSystemAddress,
         int8 _transitEvmExtraWeiDecimals,
         uint32 _perpDex,
-        uint64 _settleWindowBlocks
+        uint64 _settleWindowBlocks,
+        uint32 _underlyingSpotAsset,
+        uint256 _usdToUnderlyingScale,
+        bool _isNativeUnderlying
     ) {
         parentVault = _parentVault;
         asset = IVaultV2(_parentVault).asset();
@@ -133,9 +154,24 @@ contract HyperCoreAdapter is IAdapter {
         transitEvmExtraWeiDecimals = _transitEvmExtraWeiDecimals;
         perpDex = _perpDex;
         settleWindowBlocks = _settleWindowBlocks;
+        underlyingSpotAsset = _underlyingSpotAsset;
+        usdToUnderlyingScale = _usdToUnderlyingScale;
+        isNativeUnderlying = _isNativeUnderlying;
         adapterId = keccak256(abi.encode("this", address(this)));
         // Allow the vault to pull funds back during deallocate().
         require(IERC20(asset).approve(_parentVault, type(uint256).max), "approve");
+    }
+
+    /// @dev Accepts native value: WHYPE unwraps during bridgeToCore, and Core->EVM HYPE
+    ///      arrivals land as native transfers (wrapped back via wrapNative()).
+    receive() external payable {}
+
+    /// @notice Wrap any native balance back into the underlying (WHYPE). Permissionless:
+    ///         Core->EVM native arrivals are async, so wrapping is a separate step.
+    function wrapNative() external {
+        if (isNativeUnderlying && address(this).balance > 0) {
+            IWrappedNative(asset).deposit{value: address(this).balance}();
+        }
     }
 
     /* ----------------------------- Config (curator-only) --------------------------- */
@@ -189,7 +225,14 @@ contract HyperCoreAdapter is IAdapter {
     function bridgeToCore(uint256 amount) external onlyAllocator {
         if (!HyperCoreReader.coreUserExists(address(this))) revert CoreAccountMissing();
         pruneSettled();
-        require(IERC20(asset).transfer(transitSystemAddress, amount), "transfer failed");
+        if (isNativeUnderlying) {
+            // WHYPE -> native -> system address (0x2222...2222). Proven for contracts.
+            IWrappedNative(asset).withdraw(amount);
+            (bool ok,) = transitSystemAddress.call{value: amount}("");
+            require(ok, "native send failed");
+        } else {
+            require(IERC20(asset).transfer(transitSystemAddress, amount), "transfer failed");
+        }
         uint64 nowL1 = HyperCoreReader.l1BlockNumber();
         pendingToCore.push(PendingDeposit({amount: uint128(amount), initL1Block: nowL1}));
         emit BridgedToCore(amount, nowL1);
@@ -292,8 +335,22 @@ contract HyperCoreAdapter is IAdapter {
     ///      until multi-dex reading lands (see PRODUCTION.md).
     function realAssets() public view returns (uint256) {
         uint256 idle = IERC20(asset).balanceOf(address(this));
-        uint256 observed = idle + _transitSpotEvm() + _usdcSpotEvm() + _perpEquityEvm() + _inTransitToCore();
+        if (isNativeUnderlying) idle += address(this).balance; // Core->EVM arrivals pre-wrap
+        uint256 usdValue = _usdcSpotUsd() + _perpEquityUsd();
+        uint256 observed =
+            idle + _transitSpotEvm() + _usdToUnderlying(usdValue) + _inTransitToCore();
         return _applyGainCeiling(observed);
+    }
+
+    /// @dev Price USD-denominated Core value (6-decimals units) in underlying units using the
+    ///      UNDERLYING/USDC order-book ask (higher px => fewer underlying units => conservative,
+    ///      never overstates NAV). For stable underlyings this also prices depeg risk instead
+    ///      of assuming 1:1.
+    function _usdToUnderlying(uint256 usd6) internal view returns (uint256) {
+        if (usd6 == 0) return 0;
+        (, uint64 ask) = HyperCoreReader.bbo(underlyingSpotAsset);
+        require(ask > 0, "no ask");
+        return usd6 * usdToUnderlyingScale / ask;
     }
 
     /// @dev Underlying still in transit EVM->Core whose settlement is not yet guaranteed by age.
@@ -320,7 +377,8 @@ contract HyperCoreAdapter is IAdapter {
         return observed > ceiling ? ceiling : observed;
     }
 
-    function _perpEquityEvm() internal view returns (uint256) {
+    /// @dev Perp account equity in USD (6-decimals units), floored at zero.
+    function _perpEquityUsd() internal view returns (uint256) {
         HyperCoreReader.AccountMarginSummary memory s =
             HyperCoreReader.accountMarginSummary(perpDex, address(this));
         if (s.accountValue <= 0) return 0;
@@ -334,9 +392,9 @@ contract HyperCoreAdapter is IAdapter {
         return _weiToEvm(b.total);
     }
 
-    /// @dev Core spot USDC (post-swap trading capital), counted 1:1 in underlying units.
+    /// @dev Core spot USDC (post-swap trading capital) in USD 6-decimals units.
     ///      Skipped when the underlying IS Core USDC (avoids double counting in fork tests).
-    function _usdcSpotEvm() internal view returns (uint256) {
+    function _usdcSpotUsd() internal view returns (uint256) {
         if (transitCoreToken == USDC_CORE_TOKEN) return 0;
         HyperCoreReader.SpotBalance memory b =
             HyperCoreReader.spotBalance(address(this), USDC_CORE_TOKEN);

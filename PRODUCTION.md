@@ -113,14 +113,40 @@ discontinued). Verified live on the testnet adapter by flipping modes with the a
       margin reading lands — **Session B**
 - The testnet adapter `0x5a71…` now runs in unified mode (live reference).
 
+### Underlying expansion (multi-asset vaults) — decision record (2026-07-03)
+
+Decision: keep the transit design (option 1); USDT HIP-3 perps sunset kills the no-swap
+variant; EOA-relay and HL-escalation options rejected. Swap cost quantified live:
+USDT0/USDC 4.4bps spread + 1.4bps taker (80% stable-pair discount) ≈ ~7bps round trip on
+flows only. EXPANDED to non-stable underlyings — verified constants:
+
+| Underlying | Core idx | EVM form | USDC pair | usdToUnderlyingScale |
+|---|---|---|---|---|
+| USDT0 | 268 | ERC20 `0xB8CE59FC…5ebb` (6d) | 166 (asset 10166) | 1e6 |
+| HYPE | 150 | native → WHYPE `0x5555…5555` (18d) | 107 (asset 10107) | 1e18 |
+| UBTC | 197 | ERC20 `0x9fdb…3463` (8d) | 142 (asset 10142) | 1e5 |
+
+- [x] Native-underlying branch: bridgeToCore unwraps WHYPE → sends value to `0x2222…2222`
+      (mechanism proven live by HypeBridgeProbe); Core→EVM arrivals land native, `wrapNative()`
+      (permissionless) re-wraps; realAssets counts native pre-wrap.
+- [x] Priced valuation via bbo ask (see above) — required for non-stable underlyings.
+- [ ] HYPE/BTC as DIRECT perp collateral = **portfolio margin** mode (eligible: HYPE, BTC,
+      USDC, USDT): cannot be verified on testnet ($10k account-value floor) and adds
+      borrow-fee mechanics to valuation — deferred; until then non-stable underlyings swap
+      to USDC on their pair like USDT0 does — **Session B/D**
+- [ ] Live rehearsal of the WHYPE loop on testnet (HYPE is native there too) — **Session D**
+
 ### realAssets() hardening — **Session B**
 
 - [ ] Multi-asset spot valuation: value non-USDC spot holdings on-chain via precompiles —
       `spotPx` (0x0808), `markPx` (0x0806), `oraclePx` (0x0807), and **`bbo` (0x080e) for
       order-book mid** ((bid+ask)/2). Off-chain cross-check via info endpoint `allMids`.
       Decide the source hierarchy (oracle > mid > mark?) and haircut policy.
-- [ ] Price the USDC↔underlying (USDT0) conversion in `realAssets()` — currently counted 1:1
-      (stable-vs-stable, documented); use the USDT0/USDC pair (166) px with a conservative bound
+- [x] Price the USDC↔underlying conversion in `realAssets()` — DONE: USD-denominated Core
+      value (perp equity + spot USDC) is priced via the `bbo` precompile (0x080e) at the ASK
+      of the UNDERLYING/USDC pair (conservative; fails closed on an empty book). Replaces the
+      1:1 stable assumption and prices depeg risk. bbo raw px scaling verified on-chain:
+      human px * 10^(8 - baseSzDecimals).
 - [ ] Open-markets registry: track which perps/spot pairs the account can hold so valuation
       can enumerate and conservatively re-mark positions (mark vs oracle divergence)
 - [ ] Confirm `accountMarginSummary.accountValue` semantics under isolated vs cross margin

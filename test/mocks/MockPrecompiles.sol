@@ -57,6 +57,20 @@ contract MockL1Block {
     }
 }
 
+contract MockBbo {
+    uint64 internal bid;
+    uint64 internal ask;
+
+    function set(uint64 _bid, uint64 _ask) external {
+        bid = _bid;
+        ask = _ask;
+    }
+
+    fallback(bytes calldata) external returns (bytes memory) {
+        return abi.encode(bid, ask);
+    }
+}
+
 contract MockCoreUserExists {
     bool internal exists;
 
