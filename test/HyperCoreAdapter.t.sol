@@ -67,7 +67,11 @@ contract HyperCoreAdapterTest is Test {
     }
 
     function _setPerpEquity(uint256 evmUsdc) internal {
-        MockAccountMargin(ACCOUNT_MARGIN).set(int64(int256(evmUsdc)), 0, 0, 0);
+        MockAccountMargin(ACCOUNT_MARGIN).set(0, int64(int256(evmUsdc)), 0, 0, 0);
+    }
+
+    function _setDexEquity(uint32 dex, int64 v) internal {
+        MockAccountMargin(ACCOUNT_MARGIN).set(dex, v, 0, 0, 0);
     }
 
     function _setTransitSpot(uint256 evmAmount) internal {
@@ -421,5 +425,47 @@ contract HyperCoreAdapterTest is Test {
         assertEq(address(hypeAdapter).balance, 0);
         assertEq(whype.balanceOf(address(hypeAdapter)), 3 ether);
         assertEq(hypeAdapter.realAssets(), 3 ether);
+    }
+
+    /* ----------------------------- Session B: multi-dex + tracked tokens ----------- */
+
+    function test_extraPerpDexes_summedAndFlooredPerDex() public {
+        _setPerpEquity(50e6); // dex 0
+        vm.startPrank(curator);
+        adapter.addPerpDex(3);
+        adapter.addPerpDex(7);
+        vm.stopPrank();
+        _setDexEquity(3, 30e6);
+        _setDexEquity(7, -20e6); // underwater dex floors at 0, must not offset dex 3
+
+        assertEq(adapter.realAssets(), 80e6);
+    }
+
+    function test_trackedTokens_valuedAtBid() public {
+        vm.prank(curator);
+        // e.g. a HYPE-like token: weiDecimals 8, szDec 2 -> pd 1e6 -> scale 1e8*1e6/1e6 = 1e8
+        adapter.addTrackedToken(150, 10107, 1e8);
+        MockSpotBalance(SPOT_BALANCE).set(150, 2e8, 0, 0); // 2.0 tokens (8-dec wei)
+        MockBbo(BBO).set(40e6, 41e6); // token/USDC book 40/41 — held asset values at BID
+
+        // usd = 2e8 * 40e6 / 1e8 = 80e6; underlying/USDC ask is also 41e6?? NO: bbo mock is
+        // global — underlying conversion uses ask 41e6: 80e6 * 1e6 / 41e6
+        assertEq(adapter.realAssets(), uint256(2e8) * 40e6 / 1e8 * 1e6 / 41e6);
+    }
+
+    function test_registry_curatorGatedAndBounded() public {
+        vm.prank(stranger);
+        vm.expectRevert(HyperCoreAdapter.NotCurator.selector);
+        adapter.addPerpDex(1);
+
+        vm.startPrank(curator);
+        for (uint32 i; i < 8; i++) adapter.addPerpDex(i + 1);
+        vm.expectRevert(HyperCoreAdapter.RegistryFull.selector);
+        adapter.addPerpDex(99);
+        adapter.removePerpDex(0);
+        adapter.addPerpDex(99); // slot freed
+        vm.stopPrank();
+        (uint256 d,) = adapter.registryLengths();
+        assertEq(d, 8);
     }
 }

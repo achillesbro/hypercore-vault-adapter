@@ -6,21 +6,25 @@ pragma solidity ^0.8.28;
 ///      state. `set` carries a real selector so it never collides with the zero-prefixed read calls.
 ///      Etch these at the precompile addresses with vm.etch, then call set().
 
+/// @dev Keyed by perp dex: reads decode (uint32 dex, address user) like the real 0x080f.
 contract MockAccountMargin {
-    int64 internal accountValue;
-    uint64 internal marginUsed;
-    uint64 internal ntlPos;
-    int64 internal rawUsd;
-
-    function set(int64 _accountValue, uint64 _marginUsed, uint64 _ntlPos, int64 _rawUsd) external {
-        accountValue = _accountValue;
-        marginUsed = _marginUsed;
-        ntlPos = _ntlPos;
-        rawUsd = _rawUsd;
+    struct S {
+        int64 accountValue;
+        uint64 marginUsed;
+        uint64 ntlPos;
+        int64 rawUsd;
     }
 
-    fallback(bytes calldata) external returns (bytes memory) {
-        return abi.encode(accountValue, marginUsed, ntlPos, rawUsd);
+    mapping(uint32 => S) internal summaries;
+
+    function set(uint32 dex, int64 _accountValue, uint64 _marginUsed, uint64 _ntlPos, int64 _rawUsd) external {
+        summaries[dex] = S(_accountValue, _marginUsed, _ntlPos, _rawUsd);
+    }
+
+    fallback(bytes calldata data) external returns (bytes memory) {
+        (uint32 dex,) = abi.decode(data, (uint32, address));
+        S memory s = summaries[dex];
+        return abi.encode(s.accountValue, s.marginUsed, s.ntlPos, s.rawUsd);
     }
 }
 

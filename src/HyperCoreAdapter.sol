@@ -110,6 +110,7 @@ contract HyperCoreAdapter is IAdapter {
     error NotCurator();
     error InsufficientIdle();
     error CoreAccountMissing();
+    error RegistryFull();
 
     event ActionSent(bytes rawAction);
     event BridgedToCore(uint256 amount, uint64 initL1Block);
@@ -117,6 +118,70 @@ contract HyperCoreAdapter is IAdapter {
     event MaxGainBpsSet(uint16 bps);
     event ApiWalletApproved(address indexed agent, string name);
     event ApiWalletRevoked(string name);
+    event PerpDexAdded(uint32 dex);
+    event PerpDexRemoved(uint32 dex);
+    event TrackedTokenAdded(uint64 coreToken, uint32 spotAsset, uint256 usdPerWeiScale);
+    event TrackedTokenRemoved(uint64 coreToken);
+
+    /* ------------------------ Valuation registries (curator) ------------------------ */
+
+    /// @dev Hard bound so realAssets() gas stays O(1)-ish and a curator mistake can't brick
+    ///      the vault's accrual loop with an unbounded precompile scan.
+    uint256 internal constant MAX_REGISTRY = 8;
+
+    /// @notice Additional perp dexes whose margin summaries count toward valuation (the
+    ///         constructor `perpDex` is always read). Under unified accounts, positions on
+    ///         HIP-3 dexes (e.g. USDT-margined) are otherwise INVISIBLE to valuation — the
+    ///         operator must register every dex the agent is allowed to trade.
+    uint32[] public extraPerpDexes;
+
+    /// @notice Non-USDC, non-underlying Core spot tokens to value (e.g. residual dust from
+    ///         swaps, or strategy holdings). Valued at the order-book BID of their USDC pair
+    ///         (what a sale would fetch — conservative for held assets).
+    struct TrackedToken {
+        uint64 coreToken; // Core token index
+        uint32 spotAsset; // 10000 + TOKEN/USDC pair index
+        uint256 usdPerWeiScale; // usd6 = balanceWei * rawBidPx / usdPerWeiScale (verified per token)
+    }
+
+    TrackedToken[] public trackedTokens;
+
+    function addPerpDex(uint32 dex) external onlyCurator {
+        if (extraPerpDexes.length >= MAX_REGISTRY) revert RegistryFull();
+        extraPerpDexes.push(dex);
+        emit PerpDexAdded(dex);
+    }
+
+    function removePerpDex(uint256 index) external onlyCurator {
+        uint32 dex = extraPerpDexes[index];
+        extraPerpDexes[index] = extraPerpDexes[extraPerpDexes.length - 1];
+        extraPerpDexes.pop();
+        emit PerpDexRemoved(dex);
+    }
+
+    /// @param usdPerWeiScale For a token with Core weiDecimals `wd` and bbo price divisor
+    ///        `pd = 10^(8 - szDecimals)`: scale = 10^wd * pd / 1e6. Verified per token
+    ///        before registration (same policy as constructor constants).
+    function addTrackedToken(uint64 coreToken, uint32 spotAsset, uint256 usdPerWeiScale)
+        external
+        onlyCurator
+    {
+        if (trackedTokens.length >= MAX_REGISTRY) revert RegistryFull();
+        require(usdPerWeiScale > 0, "scale");
+        trackedTokens.push(TrackedToken(coreToken, spotAsset, usdPerWeiScale));
+        emit TrackedTokenAdded(coreToken, spotAsset, usdPerWeiScale);
+    }
+
+    function removeTrackedToken(uint256 index) external onlyCurator {
+        uint64 tok = trackedTokens[index].coreToken;
+        trackedTokens[index] = trackedTokens[trackedTokens.length - 1];
+        trackedTokens.pop();
+        emit TrackedTokenRemoved(tok);
+    }
+
+    function registryLengths() external view returns (uint256 dexes, uint256 tokens) {
+        return (extraPerpDexes.length, trackedTokens.length);
+    }
 
     modifier onlyVault() {
         if (msg.sender != parentVault) revert NotVault();
@@ -336,10 +401,33 @@ contract HyperCoreAdapter is IAdapter {
     function realAssets() public view returns (uint256) {
         uint256 idle = IERC20(asset).balanceOf(address(this));
         if (isNativeUnderlying) idle += address(this).balance; // Core->EVM arrivals pre-wrap
-        uint256 usdValue = _usdcSpotUsd() + _perpEquityUsd();
+        uint256 usdValue = _usdcSpotUsd() + _perpEquityUsd(perpDex) + _extraDexesUsd()
+            + _trackedTokensUsd();
         uint256 observed =
             idle + _transitSpotEvm() + _usdToUnderlying(usdValue) + _inTransitToCore();
         return _applyGainCeiling(observed);
+    }
+
+    /// @dev Equity across curator-registered extra perp dexes (USD 6-decimals, floored at 0
+    ///      per dex — one underwater dex must not offset another's collateral optimistically).
+    function _extraDexesUsd() internal view returns (uint256 total) {
+        uint256 n = extraPerpDexes.length;
+        for (uint256 i; i < n; i++) {
+            total += _perpEquityUsd(extraPerpDexes[i]);
+        }
+    }
+
+    /// @dev Curator-registered spot tokens valued at their USDC-pair BID (sale side).
+    function _trackedTokensUsd() internal view returns (uint256 total) {
+        uint256 n = trackedTokens.length;
+        for (uint256 i; i < n; i++) {
+            TrackedToken memory t = trackedTokens[i];
+            HyperCoreReader.SpotBalance memory b =
+                HyperCoreReader.spotBalance(address(this), t.coreToken);
+            if (b.total == 0) continue;
+            (uint64 bid,) = HyperCoreReader.bbo(t.spotAsset);
+            total += uint256(b.total) * bid / t.usdPerWeiScale;
+        }
     }
 
     /// @dev Price USD-denominated Core value (6-decimals units) in underlying units using the
@@ -377,10 +465,10 @@ contract HyperCoreAdapter is IAdapter {
         return observed > ceiling ? ceiling : observed;
     }
 
-    /// @dev Perp account equity in USD (6-decimals units), floored at zero.
-    function _perpEquityUsd() internal view returns (uint256) {
+    /// @dev Perp account equity on `dex` in USD (6-decimals units), floored at zero.
+    function _perpEquityUsd(uint32 dex) internal view returns (uint256) {
         HyperCoreReader.AccountMarginSummary memory s =
-            HyperCoreReader.accountMarginSummary(perpDex, address(this));
+            HyperCoreReader.accountMarginSummary(dex, address(this));
         if (s.accountValue <= 0) return 0;
         return Decimals.perpUsdToEvm(uint256(uint64(s.accountValue)));
     }
