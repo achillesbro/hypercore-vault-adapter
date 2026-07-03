@@ -206,6 +206,9 @@ contract HyperCoreAdapter is IAdapter {
     }
 
     /// @notice Move USD collateral between the spot and perp accounts on HyperCore.
+    /// @dev Only meaningful in standard/split abstraction mode. Under a UNIFIED account
+    ///      (see realAssets natspec) spot USDC directly collateralizes perps and this action
+    ///      is silently dropped by Core (verified live: tx succeeds, no ledger entry).
     function transferUsdClass(uint64 ntl, bool toPerp) external onlyAllocator {
         _send(HyperCoreActions.usdClassTransfer(ntl, toPerp));
     }
@@ -277,6 +280,16 @@ contract HyperCoreAdapter is IAdapter {
     ///      rather than fabricate a value — the vault freezes (liveness) but never misprices.
     ///      Core USDC (spot + perp equity) counts 1:1 in underlying units (stable-vs-stable);
     ///      a priced conversion is tracked as a valuation-hardening follow-up.
+    ///
+    ///      ABSTRACTION-MODE INVARIANT (verified live on testnet in both modes): the precompiles
+    ///      partition account value cleanly, so spotBalance + accountMarginSummary.accountValue
+    ///      sums to the same total whether the account runs in standard/split mode (spot=0
+    ///      while collateral sits in perp accountValue) or in Hyperliquid's UNIFIED account
+    ///      mode (spotBalance returns the free balance, accountValue returns held margin +
+    ///      uPnL). No double count in either mode; losses flow through accountValue in both.
+    ///      Caveat: only `perpDex` is read — positions opened on other HIP-3 dexes (e.g.
+    ///      USDT-margined CASH perps) would be invisible to valuation; do not trade them
+    ///      until multi-dex reading lands (see PRODUCTION.md).
     function realAssets() public view returns (uint256) {
         uint256 idle = IERC20(asset).balanceOf(address(this));
         uint256 observed = idle + _transitSpotEvm() + _usdcSpotEvm() + _perpEquityEvm() + _inTransitToCore();

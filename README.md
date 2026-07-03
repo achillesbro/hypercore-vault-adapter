@@ -67,13 +67,21 @@ USDT0/USDC spot pair 166). Full flow rehearsed by a contract end-to-end on testn
 
 1. Curator (timelocked): `addAdapter`, then `increaseAbsoluteCap` for each id from `ids()`.
 2. One-time: create the adapter's Core account (any Core-side dust send) — `bridgeToCore`
-   reverts with `CoreAccountMissing` otherwise (escrow-limbo guard).
+   reverts with `CoreAccountMissing` otherwise (escrow-limbo guard). Then set the account's
+   abstraction mode to **unified** via the agent (`agentSetAbstraction`) while the account is
+   flat — deliberate and effectively one-way for contracts (see PRODUCTION.md).
 3. `vault.allocate(adapter, abi.encode(market), amount)` → USDT0 idle in adapter.
 4. `adapter.bridgeToCore(amount)` → ERC20 transfer to the system address → Core **spot** credit.
 5. IOC-swap USDT0→USDC on spot pair 166 (`placeOrder(10166, …)` or the agent wallet).
-6. `adapter.transferUsdClass(ntl, toPerp=true)` → margin to the **perp** account; trade via agent.
-7. Unwind: close positions → `transferUsdClass(false)` → swap USDC→USDT0 → `bridgeToEvm`
-   (spotSend) → `vault.deallocate(...)`.
+6. Trade via the agent — under a unified account, spot USDC directly collateralizes perps
+   (no class transfer needed; `transferUsdClass` remains for standard-mode accounts, where
+   it moves margin spot↔perp, and is a harmless no-op under unified).
+7. Unwind: close positions → swap USDC→USDT0 → `bridgeToEvm` (spotSend) →
+   `vault.deallocate(...)`.
+
+`realAssets()` is **abstraction-mode invariant** (verified live in both modes): the
+spotBalance and accountMarginSummary precompiles partition account value cleanly, so the sum
+is identical whether the account runs standard/split or unified.
 
 ## Valuation & in-flight accounting
 

@@ -85,6 +85,34 @@ transfers are not indexed for USDC.
 
 ## Tier 1 — correctness & safety
 
+### Account abstraction modes (unified accounts) — **resolved (verified live, 2026-07-03)**
+
+Hyperliquid now has per-account *abstraction modes*: **unified** (single balance per asset,
+spot collateralizes perps), **portfolio margin**, **standard/split** (the old model, still
+recommended by the docs for automated users), and legacy dex-abstraction ("default", being
+discontinued). Verified live on the testnet adapter by flipping modes with the agent:
+
+- **`realAssets()` is mode-invariant, zero code change needed**: the precompiles partition
+  value cleanly. Standard: spot=0, perp `accountValue`=collateral+uPnL. Unified: spot=free
+  balance, `accountValue`=held margin+uPnL. Observed sums identical (7.166227 both ways);
+  encoded as `test_realAssets_abstractionModeInvariant`.
+- `transferUsdClass` is a **silent no-op under unified** (tx succeeds, Core drops action 7,
+  no ledger entry) — harmless; still needed for standard-mode accounts.
+- Mode changes: `agentSetAbstraction` (agent-signed) works — the agent flipped the adapter
+  `default → unified`. Transitions are **refused with open positions/orders**, and moving
+  OUT of unified was refused even when flat → treat unified as **one-way for contract
+  accounts** (leaving may require a user signature a contract can't produce). Choose at
+  deployment, deliberately, while flat.
+- Recommendation for the adapter: **unified** — removes the class-transfer step from the
+  funding flow (bridge → swap → trade) and the "USDC stuck in wrong class" failure mode.
+  The 50k-actions/day cap is irrelevant at vault scale. (Docs recommend standard for
+  builders mainly for that cap + builder-fee accrual, which we don't use.)
+- [ ] Multi-dex caveat (now sharper under unified): only `perpDex` is read by valuation;
+      USDT0 spot can collateralize USDT-margined HIP-3 dexes (e.g. CASH perps) under unified,
+      which would be INVISIBLE to `realAssets()`. Forbid via operator policy until multi-dex
+      margin reading lands — **Session B**
+- The testnet adapter `0x5a71…` now runs in unified mode (live reference).
+
 ### realAssets() hardening — **Session B**
 
 - [ ] Multi-asset spot valuation: value non-USDC spot holdings on-chain via precompiles —

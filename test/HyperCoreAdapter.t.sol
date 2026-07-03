@@ -278,6 +278,28 @@ contract HyperCoreAdapterTest is Test {
         assertEq(uint256(HyperCoreActions.spotAssetId(5)), 10005);
     }
 
+    /// @dev Mirrors the live-testnet observation (2026-07): the same account value partitions
+    ///      differently across the spotBalance/accountMarginSummary precompiles depending on
+    ///      the Hyperliquid abstraction mode, but the SUM is identical — realAssets() is
+    ///      mode-invariant with no code change.
+    function test_realAssets_abstractionModeInvariant() public {
+        _allocate(0); // no idle; pure Core-side valuation
+
+        // Standard/split mode: all collateral + uPnL reported in perp accountValue, spot 0.
+        _setUsdcSpot(0);
+        _setPerpEquity(7_166227);
+        uint256 standardMode = adapter.realAssets();
+
+        // Unified mode: spot returns the free balance, accountValue returns held margin + uPnL.
+        _setUsdcSpot(5_920027);
+        _setPerpEquity(1_246200);
+        uint256 unifiedMode = adapter.realAssets();
+
+        assertEq(standardMode, 7_166227);
+        assertEq(unifiedMode, 7_166227);
+        assertEq(standardMode, unifiedMode);
+    }
+
     /* ----------------------------- API / agent wallet ------------------------------ */
 
     address agent = address(0xA9E27);
