@@ -23,7 +23,9 @@
       revocation kill switch verified ("API Wallet does not exist" post-revoke)
 - [x] Loss realization through real vault accounting (fork test, isolate mode)
 - [x] Operator tooling: `flow.py`, `agent_trade.py`, `accept_terms.py`, `check_core_state.py`
-- [x] 22 unit tests + 6 mainnet-fork tests green
+- [x] Adapter-level timelock (VaultV2's submit system) on trust-increasing config + order guard
+      on the placeOrder fallback (Session C, `timelock-guard`)
+- [x] 49 unit tests + 8 mainnet-fork tests green
 
 Deployed (testnet, chainid 998): vault `0x84ec0fca475d13a7fd3af55b752c584f9791171f`,
 adapter v2 `0x5a71C5A4DA2c6B5B32B91ef2b83B2d4aC28bFF8e`,
@@ -201,15 +203,25 @@ through in full, gains are `maxRate`-capped).
 - [deferred] Agent-key OpSec (custody, rotation ~1yr expiry `validUntil`, off-chain risk
   limits) — internal use for now. NEVER reuse the testnet pattern (key in chat/browser) on
   mainnet.
-- [ ] **Timelock `approveApiWallet`** — **Session C**. Changing the agent is the highest-trust
-      action on the adapter (delegates all trading). Route it through the vault's
-      submit/timelock pattern (or an adapter-level timelock mirroring it). Keep
-      `revokeApiWallet` instant (kill switch must not be timelocked).
-- [ ] Move `setSettleWindowBlocks` / `setMaxGainBps` behind the same timelock — **Session C**
-- [ ] (optional) Guard layer à la deployed adapter's `requireTrustline`: every state-changing
-      call passes an oracle-approval / sanity check (price bands, max notional per action,
-      allowed-assets whitelist). Lightweight on-chain checks are enough for educational use.
-      — **Session C**
+- [x] **Timelock `approveApiWallet`** — DONE (`timelock-guard`, Session C). Adapter-level
+      timelock mirroring VaultV2/MorphoMarketV1AdapterV2's submit/execute/revoke system
+      verbatim (curator submits calldata, anyone executes after `timelock[selector]`,
+      curator/sentinel revokes pending; increase/decrease/abdicate semantics identical,
+      decreaseTimelock delayed by the target selector's current duration). `revokeApiWallet`
+      stays instant and gained the vault's sentinel as a third emergency caller. Timelocks
+      default to 0 — set them (like the vault's own) before adding the adapter to the vault.
+- [x] Move `setSettleWindowBlocks` / `setMaxGainBps` behind the same timelock — DONE. Also
+      `addTrackedToken` (its curator-supplied `usdPerWeiScale` is a NAV-inflation lever —
+      depositor-hurting, so timelocked); `addPerpDex` stays instant (only adds what the
+      precompile actually reports, floored at 0 — cannot overstate NAV); removals stay instant
+      (conservative direction).
+- [x] Guard layer on the on-chain `placeOrder` fallback — DONE: default-deny per-asset
+      whitelist + per-order size cap + price band anchored to the live `bbo` (buy vs ask,
+      sell vs bid — a limit buy fills ≤ limitPx / sell ≥ limitPx, so the band bounds the worst
+      fill; a compromised allocator can't donate value through the spread). `setOrderGuard`
+      (loosening) is timelocked; `disallowOrders` (curator or sentinel) is the instant brake.
+      NOTE the honest limit: the guard covers only on-chain orders — the agent wallet trades
+      off-chain and is constrained only by revocation + off-chain risk limits (Tier 2 OpSec).
 - [deferred] Production role assignment (multisigs), caps policy, adapterRegistry
 
 ## Tier 3 — testing, ops, deploy (after the contract stabilizes)

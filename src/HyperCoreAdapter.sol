@@ -48,6 +48,14 @@ interface IWrappedNative {
 ///        sum. The ONLY gap is EVM->Core bridging: the ERC20 transfer debits idle synchronously
 ///        while the Core credit lands a few L1 blocks later — bridged amounts are added back
 ///        until their L1-block age proves settlement.
+///
+///      GOVERNANCE. Trust-increasing config routes through an adapter-level timelock that
+///      mirrors VaultV2's submit/execute/revoke system (curator submits, anyone executes after
+///      the per-selector delay, curator/sentinel revokes while pending): approveApiWallet,
+///      setSettleWindowBlocks, setMaxGainBps, setOrderGuard, addTrackedToken, and the timelock
+///      management itself. Trust-DECREASING actions are instant kill switches and must never be
+///      timelocked: revokeApiWallet, disallowOrders, registry removals. Timelocks default to
+///      zero — configure them (like the vault's) before adding the adapter to the vault.
 contract HyperCoreAdapter is IAdapter {
     ICoreWriter internal constant CORE_WRITER =
         ICoreWriter(0x3333333333333333333333333333333333333333);
@@ -108,9 +116,20 @@ contract HyperCoreAdapter is IAdapter {
     error NotVault();
     error NotAllocator();
     error NotCurator();
+    error NotCuratorOrSentinel();
     error InsufficientIdle();
     error CoreAccountMissing();
     error RegistryFull();
+    error DataAlreadyPending();
+    error DataNotTimelocked();
+    error TimelockNotExpired();
+    error Abdicated();
+    error TimelockNotIncreasing();
+    error TimelockNotDecreasing();
+    error AutomaticallyTimelocked();
+    error AssetNotAllowed();
+    error OrderSizeExceeded();
+    error PriceOutOfBand();
 
     event ActionSent(bytes rawAction);
     event BridgedToCore(uint256 amount, uint64 initL1Block);
@@ -122,6 +141,85 @@ contract HyperCoreAdapter is IAdapter {
     event PerpDexRemoved(uint32 dex);
     event TrackedTokenAdded(uint64 coreToken, uint32 spotAsset, uint256 usdPerWeiScale);
     event TrackedTokenRemoved(uint64 coreToken);
+    event Submit(bytes4 indexed selector, bytes data, uint256 executableAt);
+    event Accept(bytes4 indexed selector, bytes data);
+    event Revoke(address indexed caller, bytes4 indexed selector, bytes data);
+    event IncreaseTimelock(bytes4 indexed selector, uint256 newDuration);
+    event DecreaseTimelock(bytes4 indexed selector, uint256 newDuration);
+    event Abdicate(bytes4 indexed selector);
+    event OrderGuardSet(uint32 indexed coreAsset, uint64 maxSz, uint16 priceBandBps);
+    event OrderGuardDisallowed(uint32 indexed coreAsset);
+
+    /* ------------------------ Timelocks (mirrors VaultV2's system) ------------------ */
+
+    /// @dev Same submit/execute/revoke system as VaultV2 and MorphoMarketV1AdapterV2 (see dev
+    ///      comments on timelocks in VaultV2.sol — they apply here). The curator SUBMITS
+    ///      calldata; once `timelock[selector]` has elapsed anyone can execute it; the curator
+    ///      or a vault sentinel can revoke it while pending. Timelocks default to ZERO at
+    ///      deployment (so initial config is instant) — set them before adding the adapter to
+    ///      the vault, like the vault's own.
+    mapping(bytes4 selector => uint256) public timelock;
+    mapping(bytes4 selector => bool) public abdicated;
+    mapping(bytes data => uint256) public executableAt;
+
+    /// @dev Will revert if the timelock value is type(uint256).max or any value that overflows
+    ///      when added to the block timestamp.
+    function submit(bytes calldata data) external {
+        if (msg.sender != IVaultV2(parentVault).curator()) revert NotCurator();
+        if (executableAt[data] != 0) revert DataAlreadyPending();
+
+        bytes4 selector = bytes4(data);
+        uint256 _timelock = selector == HyperCoreAdapter.decreaseTimelock.selector
+            ? timelock[bytes4(data[4:8])]
+            : timelock[selector];
+        executableAt[data] = block.timestamp + _timelock;
+        emit Submit(selector, data, executableAt[data]);
+    }
+
+    function timelocked() internal {
+        bytes4 selector = bytes4(msg.data);
+        if (executableAt[msg.data] == 0) revert DataNotTimelocked();
+        if (block.timestamp < executableAt[msg.data]) revert TimelockNotExpired();
+        if (abdicated[selector]) revert Abdicated();
+        executableAt[msg.data] = 0;
+        emit Accept(selector, msg.data);
+    }
+
+    function revoke(bytes calldata data) external {
+        if (msg.sender != IVaultV2(parentVault).curator() && !IVaultV2(parentVault).isSentinel(msg.sender)) {
+            revert NotCuratorOrSentinel();
+        }
+        if (executableAt[data] == 0) revert DataNotTimelocked();
+        executableAt[data] = 0;
+        emit Revoke(msg.sender, bytes4(data), data);
+    }
+
+    /// @dev This function requires great caution because it can irreversibly disable submit for
+    ///      a selector. Existing pending operations submitted before increasing a timelock can
+    ///      still be executed at their initial executableAt.
+    function increaseTimelock(bytes4 selector, uint256 newDuration) external {
+        timelocked();
+        if (selector == HyperCoreAdapter.decreaseTimelock.selector) revert AutomaticallyTimelocked();
+        if (newDuration < timelock[selector]) revert TimelockNotIncreasing();
+        timelock[selector] = newDuration;
+        emit IncreaseTimelock(selector, newDuration);
+    }
+
+    /// @dev Timelocked by the duration of the selector being decreased (see submit).
+    function decreaseTimelock(bytes4 selector, uint256 newDuration) external {
+        timelocked();
+        if (selector == HyperCoreAdapter.decreaseTimelock.selector) revert AutomaticallyTimelocked();
+        if (newDuration > timelock[selector]) revert TimelockNotDecreasing();
+        timelock[selector] = newDuration;
+        emit DecreaseTimelock(selector, newDuration);
+    }
+
+    /// @dev This function requires great caution because it irreversibly disables a selector.
+    function abdicate(bytes4 selector) external {
+        timelocked();
+        abdicated[selector] = true;
+        emit Abdicate(selector);
+    }
 
     /* ------------------------ Valuation registries (curator) ------------------------ */
 
@@ -146,6 +244,8 @@ contract HyperCoreAdapter is IAdapter {
 
     TrackedToken[] public trackedTokens;
 
+    /// @dev Instant: a dex entry only ADDS what the precompile actually reports for this
+    ///      account (floored at zero) — it cannot overstate NAV, so no timelock is needed.
     function addPerpDex(uint32 dex) external onlyCurator {
         if (extraPerpDexes.length >= MAX_REGISTRY) revert RegistryFull();
         extraPerpDexes.push(dex);
@@ -162,10 +262,12 @@ contract HyperCoreAdapter is IAdapter {
     /// @param usdPerWeiScale For a token with Core weiDecimals `wd` and bbo price divisor
     ///        `pd = 10^(8 - szDecimals)`: scale = 10^wd * pd / 1e6. Verified per token
     ///        before registration (same policy as constructor constants).
+    /// @dev TIMELOCKED: a too-small scale (or wrong pair) INFLATES NAV arbitrarily — this is a
+    ///      depositor-hurting lever, unlike addPerpDex. Removal stays instant (conservative).
     function addTrackedToken(uint64 coreToken, uint32 spotAsset, uint256 usdPerWeiScale)
         external
-        onlyCurator
     {
+        timelocked();
         if (trackedTokens.length >= MAX_REGISTRY) revert RegistryFull();
         require(usdPerWeiScale > 0, "scale");
         trackedTokens.push(TrackedToken(coreToken, spotAsset, usdPerWeiScale));
@@ -194,8 +296,9 @@ contract HyperCoreAdapter is IAdapter {
         _;
     }
 
-    /// @dev Config (risk params) is curator-gated, not allocator-gated. In production these should
-    ///      route through the vault's timelock; kept immediate for now (see PRODUCTION.md).
+    /// @dev Instant curator gate — used only for actions that CANNOT hurt depositors (registry
+    ///      removals, guard tightening). Trust-increasing config routes through the adapter
+    ///      timelock (submit/timelocked) instead, mirroring the vault's own governance.
     modifier onlyCurator() {
         if (msg.sender != IVaultV2(parentVault).curator()) revert NotCurator();
         _;
@@ -239,14 +342,19 @@ contract HyperCoreAdapter is IAdapter {
         }
     }
 
-    /* ----------------------------- Config (curator-only) --------------------------- */
+    /* ----------------------------- Config (timelocked) ----------------------------- */
 
-    function setSettleWindowBlocks(uint64 blocks) external onlyCurator {
+    /// @dev Mis-set in either direction it biases NAV (see PRODUCTION.md "settlement window
+    ///      calibration") — timelocked like the vault's own risk parameters.
+    function setSettleWindowBlocks(uint64 blocks) external {
+        timelocked();
         settleWindowBlocks = blocks;
         emit SettleWindowSet(blocks);
     }
 
-    function setMaxGainBps(uint16 bps) external onlyCurator {
+    /// @dev Raising (or disabling, bps=0) the ceiling loosens the NAV-spike defense — timelocked.
+    function setMaxGainBps(uint16 bps) external {
+        timelocked();
         require(bps <= MAX_BPS, "bps");
         maxGainBps = bps;
         emit MaxGainBpsSet(bps);
@@ -321,10 +429,71 @@ contract HyperCoreAdapter is IAdapter {
         _send(HyperCoreActions.usdClassTransfer(ntl, toPerp));
     }
 
+    /* ----------------------------- Order guard -------------------------------------- */
+
+    /// @dev Lightweight on-chain sanity checks on the placeOrder fallback path (à la the
+    ///      reference adapter's requireTrustline): default-deny asset whitelist, per-order size
+    ///      cap, and a price band against the live order book. NOTE: this guards only on-chain
+    ///      orders — the agent wallet trades off-chain and can only be constrained by
+    ///      revocation and off-chain risk limits.
+    struct OrderGuard {
+        bool allowed;
+        uint64 maxSz; // max size per order, raw sz units (type(uint64).max = uncapped)
+        uint16 priceBandBps; // max limitPx deviation from bbo (buy: vs ask, sell: vs bid); 0 = off
+    }
+
+    mapping(uint32 coreAsset => OrderGuard) public orderGuard;
+
+    /// @notice Allow (or re-parameterize) on-chain orders on `coreAsset`. TIMELOCKED — this
+    ///         loosens what an allocator can do with vault funds.
+    function setOrderGuard(uint32 coreAsset, uint64 maxSz, uint16 priceBandBps) external {
+        timelocked();
+        require(priceBandBps <= MAX_BPS, "band");
+        orderGuard[coreAsset] = OrderGuard(true, maxSz, priceBandBps);
+        emit OrderGuardSet(coreAsset, maxSz, priceBandBps);
+    }
+
+    /// @notice Instantly forbid on-chain orders on `coreAsset` (kill switch — tightening is
+    ///         never timelocked). Curator or a vault sentinel.
+    function disallowOrders(uint32 coreAsset) external {
+        if (msg.sender != IVaultV2(parentVault).curator() && !IVaultV2(parentVault).isSentinel(msg.sender)) {
+            revert NotCuratorOrSentinel();
+        }
+        delete orderGuard[coreAsset];
+        emit OrderGuardDisallowed(coreAsset);
+    }
+
+    /// @dev A resting/IOC limit BUY fills at <= limitPx and a SELL at >= limitPx, so bounding
+    ///      limitPx against the opposite side of the live book bounds the worst possible fill —
+    ///      an allocator (mistaken or compromised) cannot donate value through the spread.
+    function _checkOrderGuard(uint32 coreAsset, bool isBuy, uint64 limitPx, uint64 sz)
+        internal
+        view
+    {
+        OrderGuard memory g = orderGuard[coreAsset];
+        if (!g.allowed) revert AssetNotAllowed();
+        if (sz > g.maxSz) revert OrderSizeExceeded();
+        if (g.priceBandBps == 0) return;
+        (uint64 bid, uint64 ask) = HyperCoreReader.bbo(coreAsset);
+        if (isBuy) {
+            require(ask > 0, "no ask"); // empty side: fail closed, no band to anchor to
+            if (uint256(limitPx) > uint256(ask) + uint256(ask) * g.priceBandBps / MAX_BPS) {
+                revert PriceOutOfBand();
+            }
+        } else {
+            require(bid > 0, "no bid");
+            if (uint256(limitPx) < uint256(bid) - uint256(bid) * g.priceBandBps / MAX_BPS) {
+                revert PriceOutOfBand();
+            }
+        }
+    }
+
     /// @notice Place a limit order (on-chain fallback; primary execution is the agent wallet).
     ///         Spot vs perp is determined by `coreAsset` (perp = perp index; spot =
     ///         HyperCoreActions.spotAssetId(pairIndex)). Used notably to IOC-swap the underlying
     ///         to USDC (and back) on its Core spot pair as part of the funding flow.
+    /// @dev Guarded: the asset must be whitelisted via setOrderGuard (timelocked), and the order
+    ///      must respect the per-order size cap and the price band (see _checkOrderGuard).
     function placeOrder(
         uint32 coreAsset,
         bool isBuy,
@@ -334,6 +503,7 @@ contract HyperCoreAdapter is IAdapter {
         uint8 tif,
         uint128 cloid
     ) external onlyAllocator {
+        _checkOrderGuard(coreAsset, isBuy, limitPx, sz);
         _send(HyperCoreActions.limitOrder(coreAsset, isBuy, limitPx, sz, reduceOnly, tif, cloid));
     }
 
@@ -349,29 +519,30 @@ contract HyperCoreAdapter is IAdapter {
 
     /// @notice Authorize an off-chain agent wallet to TRADE this adapter's HyperCore account
     ///         (place/cancel spot & perp orders) via Hyperliquid's API/SDK. Primary execution path.
-    /// @dev The agent CANNOT move funds to external destinations: `agentSendAsset` is
-    ///      protocol-restricted to the master's own accounts ("Agent can only send asset to same
-    ///      user or their sub-accounts" — verified live on testnet). It CAN trade and shuffle
-    ///      funds between this account's spot/perp/sub-accounts. Getting funds back to the vault
-    ///      still requires the allocator-gated bridge/deallocate functions. Approving an agent
-    ///      therefore delegates only trading authority, so it is allocator-gated.
-    ///      Once approved, the vault cannot veto the agent's individual trades on-chain — size the
-    ///      trust accordingly and use revokeApiWallet() (also curator-callable) as the kill switch.
-    function approveApiWallet(address agent, string calldata name) external onlyAllocator {
+    /// @dev TIMELOCKED — the highest-trust action on the adapter. The agent CANNOT move funds to
+    ///      external destinations (`agentSendAsset` is protocol-restricted to the master's own
+    ///      accounts — verified live on testnet), but once approved the vault cannot veto its
+    ///      individual trades on-chain, and the order guard does not apply to it. The delay lets
+    ///      depositors exit before a new agent takes over; revokeApiWallet() stays INSTANT as
+    ///      the kill switch.
+    function approveApiWallet(address agent, string calldata name) external {
+        timelocked();
         apiWallet = agent;
         apiWalletName = name;
         _send(HyperCoreActions.addApiWallet(agent, name));
         emit ApiWalletApproved(agent, name);
     }
 
-    /// @notice Deregister the agent wallet under `name`. Callable by an allocator OR the curator
-    ///         (curator gets an emergency kill switch independent of the allocator).
+    /// @notice Deregister the agent wallet under `name`. Callable by an allocator, the curator,
+    ///         or a vault sentinel — an emergency kill switch, deliberately NOT timelocked.
     /// @dev Revocation by approving the zero address for the name — verified live on testnet
     ///      (extraAgents empties; subsequent agent orders are rejected).
     function revokeApiWallet(string calldata name) external {
-        if (!IVaultV2(parentVault).isAllocator(msg.sender) && msg.sender != IVaultV2(parentVault).curator()) {
-            revert NotAllocator();
-        }
+        if (
+            !IVaultV2(parentVault).isAllocator(msg.sender)
+                && msg.sender != IVaultV2(parentVault).curator()
+                && !IVaultV2(parentVault).isSentinel(msg.sender)
+        ) revert NotAllocator();
         if (keccak256(bytes(name)) == keccak256(bytes(apiWalletName))) {
             apiWallet = address(0);
             apiWalletName = "";

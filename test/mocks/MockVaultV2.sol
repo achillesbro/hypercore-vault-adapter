@@ -11,6 +11,7 @@ contract MockVaultV2 {
     address public asset;
     address public curator;
     mapping(address => bool) public isAllocator;
+    mapping(address => bool) public isSentinel;
 
     constructor(address _asset, address _curator) {
         asset = _asset;
@@ -19,6 +20,10 @@ contract MockVaultV2 {
 
     function setAllocator(address account, bool value) external {
         isAllocator[account] = value;
+    }
+
+    function setSentinel(address account, bool value) external {
+        isSentinel[account] = value;
     }
 
     function allocate(address adapter, bytes calldata data, uint256 assets)
