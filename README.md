@@ -106,11 +106,14 @@ Hardening built in:
 Trading is delegated to an off-chain **agent wallet** rather than placed on-chain. The adapter
 authorizes an agent via `approveApiWallet(agent, name)` (CoreWriter action 9 — the only way a
 contract, which can't sign off-chain, can delegate trading). The agent then places/cancels orders
-through Hyperliquid's normal API/SDK against the adapter's Core account. The agent **cannot
-withdraw or move funds** — only the allocator-gated bridge/deallocate paths can, so the agent's
-blast radius is bad trades, not theft. `revokeApiWallet(name)` (allocator or curator) is the kill
-switch. Fund movement (bridge, spot↔perp) stays on-chain in the adapter; only order execution is
-off-chain. On-chain `placeOrder`/`cancelOrder` remain as an optional fallback.
+through Hyperliquid's normal API/SDK against the adapter's Core account. The agent **cannot move
+funds to external destinations**: `agentSendAsset` is protocol-restricted to the master's own
+accounts — verified live ("Agent can only send asset to same user or their sub-accounts"). It CAN
+trade and shuffle funds within the adapter's spot/perp/sub-accounts (operationally handy: margin
+management without EVM txs). Exit to the vault still requires the allocator-gated
+bridge/deallocate paths, so the agent's blast radius is bad trades, not theft.
+`revokeApiWallet(name)` (allocator or curator) is the kill switch. On-chain
+`placeOrder`/`cancelOrder`/`transferUsdClass` remain as the trustless fallback.
 
 Proven live on testnet (2026-06-12, adapter `0x5a71C5A4DA2c6B5B32B91ef2b83B2d4aC28bFF8e`):
 

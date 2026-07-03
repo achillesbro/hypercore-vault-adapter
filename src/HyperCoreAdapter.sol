@@ -238,9 +238,12 @@ contract HyperCoreAdapter is IAdapter {
 
     /// @notice Authorize an off-chain agent wallet to TRADE this adapter's HyperCore account
     ///         (place/cancel spot & perp orders) via Hyperliquid's API/SDK. Primary execution path.
-    /// @dev The agent CANNOT withdraw or move funds — getting funds back to the vault still requires
-    ///      the allocator-gated bridge/deallocate functions. Approving an agent therefore delegates
-    ///      only the trading authority the allocator already holds, so it is allocator-gated.
+    /// @dev The agent CANNOT move funds to external destinations: `agentSendAsset` is
+    ///      protocol-restricted to the master's own accounts ("Agent can only send asset to same
+    ///      user or their sub-accounts" — verified live on testnet). It CAN trade and shuffle
+    ///      funds between this account's spot/perp/sub-accounts. Getting funds back to the vault
+    ///      still requires the allocator-gated bridge/deallocate functions. Approving an agent
+    ///      therefore delegates only trading authority, so it is allocator-gated.
     ///      Once approved, the vault cannot veto the agent's individual trades on-chain — size the
     ///      trust accordingly and use revokeApiWallet() (also curator-callable) as the kill switch.
     function approveApiWallet(address agent, string calldata name) external onlyAllocator {
