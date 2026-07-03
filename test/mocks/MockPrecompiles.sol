@@ -24,19 +24,24 @@ contract MockAccountMargin {
     }
 }
 
+/// @dev Keyed by token index: reads decode (address user, uint64 token) like the real 0x0801.
 contract MockSpotBalance {
-    uint64 internal total;
-    uint64 internal hold;
-    uint64 internal entryNtl;
-
-    function set(uint64 _total, uint64 _hold, uint64 _entryNtl) external {
-        total = _total;
-        hold = _hold;
-        entryNtl = _entryNtl;
+    struct Bal {
+        uint64 total;
+        uint64 hold;
+        uint64 entryNtl;
     }
 
-    fallback(bytes calldata) external returns (bytes memory) {
-        return abi.encode(total, hold, entryNtl);
+    mapping(uint64 => Bal) internal balances;
+
+    function set(uint64 token, uint64 total, uint64 hold, uint64 entryNtl) external {
+        balances[token] = Bal(total, hold, entryNtl);
+    }
+
+    fallback(bytes calldata data) external returns (bytes memory) {
+        (, uint64 token) = abi.decode(data, (address, uint64));
+        Bal memory b = balances[token];
+        return abi.encode(b.total, b.hold, b.entryNtl);
     }
 }
 
@@ -49,5 +54,31 @@ contract MockL1Block {
 
     fallback(bytes calldata) external returns (bytes memory) {
         return abi.encode(blockNumber);
+    }
+}
+
+contract MockBbo {
+    uint64 internal bid;
+    uint64 internal ask;
+
+    function set(uint64 _bid, uint64 _ask) external {
+        bid = _bid;
+        ask = _ask;
+    }
+
+    fallback(bytes calldata) external returns (bytes memory) {
+        return abi.encode(bid, ask);
+    }
+}
+
+contract MockCoreUserExists {
+    bool internal exists;
+
+    function set(bool _exists) external {
+        exists = _exists;
+    }
+
+    fallback(bytes calldata) external returns (bytes memory) {
+        return abi.encode(exists);
     }
 }
