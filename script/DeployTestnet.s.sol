@@ -23,11 +23,15 @@ import {HyperCoreAdapter} from "../src/HyperCoreAdapter.sol";
 ///           forge script script/DeployTestnet.s.sol --rpc-url $TESTNET_RPC \
 ///             --private-key $PRIVATE_KEY --broadcast --slow
 contract DeployTestnet is Script {
-    address constant USDC = 0x2B3370eE501B4a559b57D449569354196457D8Ab;
-    address constant CORE_DEPOSIT_WALLET = 0x0B80659a4076E9E93C7DbE0f10675A16a3e5C206;
-    address constant USDC_SYSTEM = 0x2000000000000000000000000000000000000000;
+    // NOTE: testnet has no USDT0; testnet USDC doubles as the vault underlying here. Its
+    // EVM->Core bridging cannot work for a contract (Circle wallet — see PRODUCTION.md); the
+    // transit mechanism itself was rehearsed live with PURR (test/probes/TransitBridgeProbe.sol).
+    // On mainnet, deploy with USDT0 as the vault asset and its verified Core token constants.
+    address constant UNDERLYING = 0x2B3370eE501B4a559b57D449569354196457D8Ab; // testnet USDC
+    address constant TRANSIT_SYSTEM = 0x2000000000000000000000000000000000000000; // token 0
+    uint64 constant TRANSIT_TOKEN = 0;
+    int8 constant TRANSIT_EXTRA = -2; // verified: wei = evm * 100
 
-    uint64 constant USDC_TOKEN = 0;
     uint32 constant PERP_DEX = 0;
     uint64 constant SETTLE_WINDOW = 30; // generous for testnet
     bytes32 constant MARKET = bytes32("BTC");
@@ -40,7 +44,7 @@ contract DeployTestnet is Script {
 
         // For the testnet dry run a single EOA holds every role: owner, curator, allocator.
         VaultV2Factory factory = new VaultV2Factory();
-        IVaultV2 vault = IVaultV2(factory.createVaultV2(deployer, USDC, bytes32(0)));
+        IVaultV2 vault = IVaultV2(factory.createVaultV2(deployer, UNDERLYING, bytes32(0)));
 
         vault.setCurator(deployer);
         vault.submit(abi.encodeCall(IVaultV2.setIsAllocator, (deployer, true)));
@@ -53,7 +57,7 @@ contract DeployTestnet is Script {
         vault.setMaxRate(uint256(200e16) / uint256(365 days));
 
         HyperCoreAdapter adapter = new HyperCoreAdapter(
-            address(vault), USDC_TOKEN, PERP_DEX, CORE_DEPOSIT_WALLET, USDC_SYSTEM, SETTLE_WINDOW
+            address(vault), TRANSIT_TOKEN, TRANSIT_SYSTEM, TRANSIT_EXTRA, PERP_DEX, SETTLE_WINDOW
         );
 
         vault.submit(abi.encodeCall(IVaultV2.addAdapter, (address(adapter))));

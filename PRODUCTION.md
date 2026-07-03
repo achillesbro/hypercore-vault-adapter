@@ -39,22 +39,45 @@ EOA both emit correct events but produce **no Core ledger entry**; funds are abs
 (500 tUSDC lost proving it). EOA recipients credit in seconds. Plain ERC20→system-address
 transfers are not indexed for USDC.
 
-Lead: **CCTP on HyperCore** (https://developers.circle.com/cctp/concepts/cctp-on-hypercore).
-CCTP v2 `TokenMessengerV2.depositForBurn` with hook data calls a `CctpForwarder` contract on
-HyperEVM which forwards USDC to a specified **HyperCore recipient**. CCTP is contract-friendly
-by design on the burn side. Live on testnet (limits: recipient must exist on HyperCore mainnet;
-≤ $1000 testnet USDC).
+**RESOLVED (2026-06, `funding-leg-hardening` branch): transit-asset design (USDT0), CCTP ruled out.**
 
-- [ ] Read the full CCTP-on-HyperCore docs + `CctpForwarder` source; get contract addresses
-- [ ] Determine whether the **HyperCore recipient can be a smart contract** (the open question —
-      if the forwarder ultimately routes through the same CoreDepositWallet indexing, the
-      restriction may persist; test with $5 before building)
-- [ ] If viable: reimplement `bridgeToCore` via CCTP (burn on HyperEVM → forwarder hook →
-      Core credit), keeping the in-flight accounting model (attestation latency ≠ 0)
-- [ ] If not viable: fallback design — HIP-1 stable (USDT0) linked-ERC20 system-address path
-      + Core spot swap to USDC (adds swap leg + slippage to bridge and `realAssets()`)
-- [ ] Testnet probe of the chosen path with small amounts before wiring into the adapter
-- [ ] Update `bridgeToEvm` if CCTP also improves the exit path (current sendAsset path works)
+- [x] CCTP investigated: `CctpForwarder` sits next to `CoreDepositWallet` in
+      `circlefin/hyperevm-circle-contracts` and forwards **into the same wallet** → CCTP
+      inherits the contract-recipient refusal. Dead end for contracts. (CCTP v2 core is live on
+      HyperEVM, domain 19, canonical CREATE2 addresses — irrelevant to us now.)
+- [x] Root cause localized by reading the wallet source: NO recipient restriction in the EVM
+      code — the refusal is HyperCore's off-chain indexer. Both wallet routes fail for contract
+      recipients: the spot route (synthetic `Transfer(recipient, systemAddress)` — ignored) and
+      the perp route (wallet self-credits then CoreWriter `sendAsset` forwards — the send is
+      dropped for contract destinations; verified in the wallet's Core ledger: our 2 tUSDC
+      probe credited the wallet but produced no onward `send`, while an EOA deposit minutes
+      earlier forwarded fine).
+- [x] Native-USDC generic path is **token-level blocked**: the mainnet USDC ERC20 *blacklists
+      the system address* ("Blacklistable: account is blacklisted", verified on fork). USDC can
+      never use the HIP-1 path; the Circle wallet is its only (EOA-only) door.
+- [x] Generic HIP-1 mechanism proven **live for contracts** (testnet probes):
+      native HYPE → `0x2222…` credited the sending contract; PURR linked-ERC20 →
+      `0x2000…0001` credited the sending contract. Discovery: funds sent before the Core
+      account exists sit safely in **`evmEscrows`** and credit in full once the account is
+      created (vs. the wallet path where funds are absorbed unrecoverably).
+- [x] **Full funding leg rehearsed end-to-end by a contract** (`test/probes/TransitBridgeProbe.sol`,
+      testnet): bridge 4.9965 PURR via system address → IOC spot-sell 4 PURR @ 4.5795 → 18.31
+      Core USDC → `usdClassTransfer` → perp accountValue 18.0. Zero EOA custody.
+- [x] Adapter reworked to the transit design: underlying = HIP-1 stable (USDT0 mainnet);
+      `bridgeToCore` = ERC20 transfer to `transitSystemAddress`, gated on `coreUserExists`
+      (0x0810) to avoid escrow limbo; `bridgeToEvm` = `spotSend` (action 6, the
+      reference-adapter-proven exit); swaps to/from USDC via `placeOrder` on the spot pair
+      (or the agent); in-flight accounting unchanged. Circle wallet dependency deleted.
+- [x] `realAssets()` extended: idle + in-transit + Core spot underlying + Core spot USDC +
+      perp equity; USDC counted 1:1 in underlying units (stable-vs-stable — priced conversion
+      is a Session B follow-up). 23 unit + 7 fork tests green (fork uses real USDT0).
+- [x] Mainnet USDT0 constants verified: Core token **268**, ERC20
+      `0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb` (6 decimals), `evm_extra_wei_decimals -2`,
+      system address `0x2000…010C`, **USDT0/USDC spot pair 166** (asset id 10166).
+- [ ] Operational prerequisite at deployment: create the adapter's Core account (any Core-side
+      dust send) before first bridge — enforced by the `CoreAccountMissing` revert
+- [ ] Live end-to-end run on mainnet with small size (testnet has no USDT0; the mechanism was
+      rehearsed with PURR) — folds into Session D
 
 ### Audit
 
@@ -68,6 +91,8 @@ by design on the burn side. Live on testnet (limits: recipient must exist on Hyp
       `spotPx` (0x0808), `markPx` (0x0806), `oraclePx` (0x0807), and **`bbo` (0x080e) for
       order-book mid** ((bid+ask)/2). Off-chain cross-check via info endpoint `allMids`.
       Decide the source hierarchy (oracle > mid > mark?) and haircut policy.
+- [ ] Price the USDC↔underlying (USDT0) conversion in `realAssets()` — currently counted 1:1
+      (stable-vs-stable, documented); use the USDT0/USDC pair (166) px with a conservative bound
 - [ ] Open-markets registry: track which perps/spot pairs the account can hold so valuation
       can enumerate and conservatively re-mark positions (mark vs oracle divergence)
 - [ ] Confirm `accountMarginSummary.accountValue` semantics under isolated vs cross margin
@@ -82,11 +107,11 @@ shares cheap, NAV pops back); too long → a silently-failed deposit carries pha
 exiting depositors overpaid at remaining LPs' expense. Testnet already falsified one
 assumed bound.
 
-- [ ] Measure real settlement latency distribution of the chosen funding path (CCTP
-      attestation time if Session A lands CCTP)
+- [ ] Measure real settlement latency distribution of the transit path (HIP-1 system-address
+      credits — observed seconds-fast on testnet probes, needs a distribution not anecdotes)
 - [ ] Set window = measured p99 + margin; document the residual mispricing bound
-- [ ] Consider event/receipt-based reconciliation instead of pure time expiry if CCTP
-      provides a verifiable delivery signal
+- [ ] Consider reconciliation against the Core spot balance delta (the credit is observable
+      via the spotBalance precompile) instead of pure time expiry
 
 ### Withdrawals & liquidity — **resolved (design decision)**
 

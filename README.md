@@ -43,31 +43,48 @@ Vault v2 is **synchronous** (deallocate must hand USDC back in the same tx). Hyp
 **asynchronous** (orders, bridging, and margin transfers settle on a *later* L1 block; reads
 don't reflect a just-queued action). So:
 
-- `allocate` / `deallocate` (vault-only) move USDC between the vault and the adapter's **idle**
-  balance. `deallocate` reverts if the requested USDC hasn't already been bridged back.
+- `allocate` / `deallocate` (vault-only) move the underlying between the vault and the adapter's
+  **idle** balance. `deallocate` reverts if the requested amount hasn't already been bridged back.
 - `bridgeToCore`, `transferUsdClass`, `placeOrder`, `cancelOrder`, `bridgeToEvm`
   (allocator-gated, via `IVaultV2.isAllocator`) do the actual trading. They never touch vault
   assets directly — the vault's share price tracks the live position through `realAssets()`.
 
+## Funding leg: the transit-asset design (USDT0)
+
+Native USDC **cannot** fund a contract's Core account from HyperEVM — proven live: the Circle
+CoreDepositWallet silently refuses contract recipients on both its routes (spot indexing and the
+perp-dex CoreWriter forward), CCTP inherits the same wallet, and the mainnet USDC ERC20
+*blacklists the system address* so the generic path is token-level blocked. The generic HIP-1
+linked-token mechanism, however, credits contract senders (proven with HYPE and PURR probes;
+funds sent before the Core account exists sit safely in `evmEscrows` until it does).
+
+So the vault's underlying is a **HIP-1 stable with a linked ERC20 — USDT0 on mainnet** (Core
+token 268, ERC20 `0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb`, system address `0x2000…010C`,
+USDT0/USDC spot pair 166). Full flow rehearsed by a contract end-to-end on testnet
+([TransitBridgeProbe](test/probes/TransitBridgeProbe.sol), PURR standing in for USDT0).
+
 ## Operator flow
 
 1. Curator (timelocked): `addAdapter`, then `increaseAbsoluteCap` for each id from `ids()`.
-2. `vault.allocate(adapter, abi.encode(market), amount)` → USDC idle in adapter.
-3. `adapter.bridgeToCore(amount)` → lands in the Core **spot** account.
-4. `adapter.transferUsdClass(ntl, toPerp=true)` → moves margin to the **perp** account.
-5. `adapter.placeOrder(perpIndex, isBuy, px, sz, reduceOnly, tif, cloid)`.
-6. Unwind: reduce-only close → `transferUsdClass(false)` → `bridgeToEvm` → `acknowledgeBridgeIn`
-   → `vault.deallocate(...)`.
+2. One-time: create the adapter's Core account (any Core-side dust send) — `bridgeToCore`
+   reverts with `CoreAccountMissing` otherwise (escrow-limbo guard).
+3. `vault.allocate(adapter, abi.encode(market), amount)` → USDT0 idle in adapter.
+4. `adapter.bridgeToCore(amount)` → ERC20 transfer to the system address → Core **spot** credit.
+5. IOC-swap USDT0→USDC on spot pair 166 (`placeOrder(10166, …)` or the agent wallet).
+6. `adapter.transferUsdClass(ntl, toPerp=true)` → margin to the **perp** account; trade via agent.
+7. Unwind: close positions → `transferUsdClass(false)` → swap USDC→USDT0 → `bridgeToEvm`
+   (spotSend) → `vault.deallocate(...)`.
 
 ## Valuation & in-flight accounting
 
-`realAssets()` sums everything observable from EVM: idle USDC + Core perp equity + Core spot USDC.
-Operations that move value *within* that set (spot↔perp class transfers, orders, Core→EVM bridges)
-leave the sum invariant and need no tracking. The only gap is **EVM→Core bridging**: the ERC20
-transfer debits idle synchronously while the Core spot credit lands a few L1 blocks later. Each such
-bridge is recorded with the L1 block it started (`0x0809` precompile) and added back to `realAssets()`
-**only until its age exceeds `settleWindowBlocks`** — after which settlement is guaranteed and the Core
-spot balance reflects it, so the add-back self-expires with no double count and no keeper.
+`realAssets()` sums everything observable from EVM: idle underlying + in-transit + Core spot
+underlying + Core spot USDC (1:1, stable-vs-stable) + perp equity. Operations that move value
+*within* that set (swaps, class transfers, Core→EVM bridges) leave the sum invariant and need no
+tracking. The only gap is **EVM→Core bridging**: the ERC20 transfer debits idle synchronously
+while the Core credit lands a few L1 blocks later. Each such bridge is recorded with the L1 block
+it started (`0x0809` precompile) and added back to `realAssets()` **only until its age exceeds
+`settleWindowBlocks`** — after which settlement is guaranteed and the Core spot balance reflects
+it, so the add-back self-expires with no double count and no keeper.
 
 Hardening built in:
 
@@ -77,12 +94,12 @@ Hardening built in:
   above cost basis, blunting a one-block mark-price spike. Losses always pass through.
 - Config (`settleWindowBlocks`, `maxGainBps`) is curator-gated, not allocator-gated.
 
-## Still open (see inline comments)
+## Still open (see PRODUCTION.md — the living tracker)
 
-- Withdrawal liquidity — instant exits served only from idle USDC; size a `forceDeallocatePenalty`.
-- Multi-asset spot valuation — price non-USDC spot via a manipulation-resistant source (oracle).
+- Withdrawal liquidity — instant exits served only from idle underlying (revert model, like Blue).
+- Multi-asset spot valuation + priced USDC↔USDT0 conversion (currently 1:1, documented).
 - Conservative perp re-marking (oracle vs mark) would require tracking the open-markets set.
-- Mainnet USDC bridges via the `CoreDepositWallet` helper, not the generic system-address path.
+- Settlement-window calibration with a measured latency distribution.
 
 ## Execution model: agent-wallet route (chosen)
 

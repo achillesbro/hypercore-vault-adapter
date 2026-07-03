@@ -13,6 +13,7 @@ library HyperCoreReader {
     address internal constant SPOT_PX = address(uint160(0x0808));
     address internal constant L1_BLOCK_NUMBER = address(uint160(0x0809));
     address internal constant ACCOUNT_MARGIN_SUMMARY = address(uint160(0x080f));
+    address internal constant CORE_USER_EXISTS = address(uint160(0x0810));
 
     struct SpotBalance {
         uint64 total;
@@ -61,5 +62,14 @@ library HyperCoreReader {
         (bool ok, bytes memory ret) = L1_BLOCK_NUMBER.staticcall(abi.encode());
         require(ok, "l1BlockNumber precompile");
         return abi.decode(ret, (uint64));
+    }
+
+    /// @dev Whether `user` has an account on HyperCore. Bridged HIP-1 funds sent to a
+    ///      non-existent account sit in `evmEscrows` (recoverable, but invisible to balances)
+    ///      until the account is created — so bridging is gated on existence.
+    function coreUserExists(address user) internal view returns (bool) {
+        (bool ok, bytes memory ret) = CORE_USER_EXISTS.staticcall(abi.encode(user));
+        require(ok, "coreUserExists precompile");
+        return abi.decode(ret, (bool));
     }
 }
