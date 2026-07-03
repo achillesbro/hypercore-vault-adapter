@@ -189,6 +189,14 @@ contract HyperEVMForkTest is Test {
         assertEq(adapter.realAssets(), 100_000e6);
         assertEq(vault.totalAssets(), 100_000e6);
 
+        // Whitelist BTC (asset 0) for on-chain orders via the adapter timelock (defaults to 0):
+        // real curator submits, then anyone executes. Band 0 — the fork's book is an etched mock.
+        vm.prank(curator);
+        adapter.submit(
+            abi.encodeCall(HyperCoreAdapter.setOrderGuard, (uint32(0), type(uint64).max, uint16(0)))
+        );
+        adapter.setOrderGuard(0, type(uint64).max, 0);
+
         // Move collateral to perp + place an order through the REAL CoreWriter.
         vm.recordLogs();
         vm.startPrank(allocator);
@@ -225,6 +233,29 @@ contract HyperEVMForkTest is Test {
         vm.prank(depositor);
         vault.withdraw(100_000e6, depositor, depositor);
         assertEq(IERC20(USDT0).balanceOf(depositor), 1_000_000e6);
+    }
+
+    /// @dev Session C: the agent-approval timelock wired to the REAL vault's roles — the vault's
+    ///      curator (not the allocator) submits on the adapter, and revocation stays instant.
+    function test_fork_agentTimelock_withRealVaultRoles() public {
+        address agent = makeAddr("agent");
+        bytes memory data = abi.encodeCall(HyperCoreAdapter.approveApiWallet, (agent, "ops"));
+
+        vm.prank(allocator); // an allocator can no longer approve, nor even submit
+        vm.expectRevert(HyperCoreAdapter.NotCurator.selector);
+        adapter.submit(data);
+
+        vm.expectRevert(HyperCoreAdapter.DataNotTimelocked.selector);
+        adapter.approveApiWallet(agent, "ops"); // and nobody can call it cold
+
+        vm.prank(curator);
+        adapter.submit(data);
+        adapter.approveApiWallet(agent, "ops"); // timelock 0 at deployment: executable at once
+        assertEq(adapter.apiWallet(), agent);
+
+        vm.prank(allocator);
+        adapter.revokeApiWallet("ops"); // kill switch: instant, no submit
+        assertEq(adapter.apiWallet(), address(0));
     }
 
     function test_fork_lossOnCore_realizedByRealVault() public {

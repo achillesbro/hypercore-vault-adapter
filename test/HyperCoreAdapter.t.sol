@@ -18,6 +18,7 @@ contract HyperCoreAdapterTest is Test {
 
     address allocator = address(0xA11);
     address curator = address(0xC0);
+    address sentinel = address(0x5E7);
     address stranger = address(0xBAD);
 
     uint64 constant TRANSIT_TOKEN = 268; // example Core token index for the underlying
@@ -45,6 +46,7 @@ contract HyperCoreAdapterTest is Test {
             SPOT_ASSET, USD_SCALE, false
         );
         vault.setAllocator(allocator, true);
+        vault.setSentinel(sentinel, true);
 
         // Install the HyperCore system contract + precompiles at their canonical addresses.
         vm.etch(CORE_WRITER, address(new MockCoreWriter()).code);
@@ -85,6 +87,19 @@ contract HyperCoreAdapterTest is Test {
     function _allocate(uint256 amount) internal {
         vm.prank(allocator);
         vault.allocate(address(adapter), abi.encode(bytes32("BTC")), amount);
+    }
+
+    /// @dev Curator submits then executes timelocked calldata (timelocks default to 0).
+    function _exec(bytes memory data) internal {
+        vm.prank(curator);
+        adapter.submit(data);
+        (bool ok,) = address(adapter).call(data);
+        require(ok, "timelocked exec failed");
+    }
+
+    /// @dev Whitelist `coreAsset` for placeOrder: uncapped size, price band disabled.
+    function _allowOrders(uint32 coreAsset) internal {
+        _exec(abi.encodeCall(HyperCoreAdapter.setOrderGuard, (coreAsset, type(uint64).max, 0)));
     }
 
     /* ----------------------------- Funding & valuation basics ---------------------- */
@@ -226,8 +241,7 @@ contract HyperCoreAdapterTest is Test {
 
     function test_maxGainBps_clampsInflatedRead() public {
         _allocate(100_000e6);
-        vm.prank(curator);
-        adapter.setMaxGainBps(1000); // allow at most +10% above cost basis
+        _exec(abi.encodeCall(HyperCoreAdapter.setMaxGainBps, (1000))); // at most +10% above cost
 
         _setPerpEquity(200_000e6); // mark-price spike
 
@@ -243,8 +257,7 @@ contract HyperCoreAdapterTest is Test {
 
     function test_maxGainBps_lossesAlwaysPassThrough() public {
         _allocate(100_000e6);
-        vm.prank(curator);
-        adapter.setMaxGainBps(1000);
+        _exec(abi.encodeCall(HyperCoreAdapter.setMaxGainBps, (1000)));
 
         vm.prank(allocator);
         adapter.bridgeToCore(100_000e6);
@@ -257,6 +270,7 @@ contract HyperCoreAdapterTest is Test {
     /* ----------------------------- Access control ---------------------------------- */
 
     function test_placeOrder_onlyAllocator() public {
+        _allowOrders(0);
         vm.prank(stranger);
         vm.expectRevert(HyperCoreAdapter.NotAllocator.selector);
         adapter.placeOrder(0, true, 1e8, 1e8, false, HyperCoreActions.TIF_IOC, 0);
@@ -268,13 +282,25 @@ contract HyperCoreAdapterTest is Test {
         adapter.bridgeToCore(1e6);
     }
 
-    function test_config_onlyCurator() public {
+    function test_config_requiresTimelock() public {
+        // Config is no longer directly callable, even by the curator — it must be submitted.
+        vm.prank(curator);
+        vm.expectRevert(HyperCoreAdapter.DataNotTimelocked.selector);
+        adapter.setMaxGainBps(500);
+
+        vm.prank(curator);
+        vm.expectRevert(HyperCoreAdapter.DataNotTimelocked.selector);
+        adapter.setSettleWindowBlocks(10);
+    }
+
+    function test_submit_onlyCurator() public {
         vm.prank(allocator); // an allocator is NOT a curator
         vm.expectRevert(HyperCoreAdapter.NotCurator.selector);
-        adapter.setMaxGainBps(500);
+        adapter.submit(abi.encodeCall(HyperCoreAdapter.setMaxGainBps, (500)));
     }
 
     function test_placeOrder_encodesVersionedAction() public {
+        _allowOrders(0);
         vm.prank(allocator);
         adapter.placeOrder(0, true, uint64(50_000e8), uint64(1e8), false, HyperCoreActions.TIF_GTC, 0);
 
@@ -317,8 +343,7 @@ contract HyperCoreAdapterTest is Test {
     address agent = address(0xA9E27);
 
     function test_approveApiWallet_encodesAction9AndStores() public {
-        vm.prank(allocator);
-        adapter.approveApiWallet(agent, "strategy-1");
+        _exec(abi.encodeCall(HyperCoreAdapter.approveApiWallet, (agent, "strategy-1")));
 
         bytes memory a = MockCoreWriter(CORE_WRITER).lastAction();
         assertEq(uint8(a[0]), 1); // version
@@ -332,15 +357,15 @@ contract HyperCoreAdapterTest is Test {
         assertEq(adapter.apiWalletName(), "strategy-1");
     }
 
-    function test_approveApiWallet_onlyAllocator() public {
-        vm.prank(stranger);
-        vm.expectRevert(HyperCoreAdapter.NotAllocator.selector);
+    function test_approveApiWallet_requiresTimelock() public {
+        // Not callable directly by ANYONE (allocator included) — must go through submit.
+        vm.prank(allocator);
+        vm.expectRevert(HyperCoreAdapter.DataNotTimelocked.selector);
         adapter.approveApiWallet(agent, "x");
     }
 
     function test_revokeApiWallet_byAllocator_clearsAndEncodesZero() public {
-        vm.prank(allocator);
-        adapter.approveApiWallet(agent, "s");
+        _exec(abi.encodeCall(HyperCoreAdapter.approveApiWallet, (agent, "s")));
         vm.prank(allocator);
         adapter.revokeApiWallet("s");
 
@@ -355,9 +380,15 @@ contract HyperCoreAdapterTest is Test {
     }
 
     function test_revokeApiWallet_byCurator_killSwitch() public {
-        vm.prank(allocator);
-        adapter.approveApiWallet(agent, "s");
-        vm.prank(curator); // curator can revoke even though it can't approve
+        _exec(abi.encodeCall(HyperCoreAdapter.approveApiWallet, (agent, "s")));
+        vm.prank(curator); // curator can revoke instantly, no timelock
+        adapter.revokeApiWallet("s");
+        assertEq(adapter.apiWallet(), address(0));
+    }
+
+    function test_revokeApiWallet_bySentinel_killSwitch() public {
+        _exec(abi.encodeCall(HyperCoreAdapter.approveApiWallet, (agent, "s")));
+        vm.prank(sentinel); // the vault's emergency role works here too
         adapter.revokeApiWallet("s");
         assertEq(adapter.apiWallet(), address(0));
     }
@@ -442,9 +473,9 @@ contract HyperCoreAdapterTest is Test {
     }
 
     function test_trackedTokens_valuedAtBid() public {
-        vm.prank(curator);
         // e.g. a HYPE-like token: weiDecimals 8, szDec 2 -> pd 1e6 -> scale 1e8*1e6/1e6 = 1e8
-        adapter.addTrackedToken(150, 10107, 1e8);
+        // addTrackedToken is timelocked: the curator-supplied scale is a NAV lever.
+        _exec(abi.encodeCall(HyperCoreAdapter.addTrackedToken, (150, 10107, 1e8)));
         MockSpotBalance(SPOT_BALANCE).set(150, 2e8, 0, 0); // 2.0 tokens (8-dec wei)
         MockBbo(BBO).set(40e6, 41e6); // token/USDC book 40/41 — held asset values at BID
 
@@ -467,5 +498,220 @@ contract HyperCoreAdapterTest is Test {
         vm.stopPrank();
         (uint256 d,) = adapter.registryLengths();
         assertEq(d, 8);
+    }
+
+    /* ----------------------------- Session C: timelock ----------------------------- */
+
+    function test_timelock_delayEnforced() public {
+        // Raise approveApiWallet's timelock to 1 day (itself timelocked; 0 initially).
+        _exec(abi.encodeCall(
+            HyperCoreAdapter.increaseTimelock, (HyperCoreAdapter.approveApiWallet.selector, 1 days)
+        ));
+
+        bytes memory data = abi.encodeCall(HyperCoreAdapter.approveApiWallet, (agent, "s"));
+        vm.prank(curator);
+        adapter.submit(data);
+        assertEq(adapter.executableAt(data), block.timestamp + 1 days);
+
+        // Too early: the delay is the whole point.
+        vm.expectRevert(HyperCoreAdapter.TimelockNotExpired.selector);
+        adapter.approveApiWallet(agent, "s");
+
+        vm.warp(block.timestamp + 1 days);
+        adapter.approveApiWallet(agent, "s"); // anyone can execute once ripe
+        assertEq(adapter.apiWallet(), agent);
+
+        // Consumed: no replay with the same pending data.
+        vm.expectRevert(HyperCoreAdapter.DataNotTimelocked.selector);
+        adapter.approveApiWallet(agent, "s");
+    }
+
+    function test_submit_rejectsDuplicatePending() public {
+        bytes memory data = abi.encodeCall(HyperCoreAdapter.setMaxGainBps, (500));
+        vm.startPrank(curator);
+        adapter.submit(data);
+        vm.expectRevert(HyperCoreAdapter.DataAlreadyPending.selector);
+        adapter.submit(data);
+        vm.stopPrank();
+    }
+
+    function test_revoke_clearsPending_curatorAndSentinel() public {
+        bytes memory data = abi.encodeCall(HyperCoreAdapter.setMaxGainBps, (500));
+        vm.prank(curator);
+        adapter.submit(data);
+        vm.prank(sentinel); // sentinel can revoke (vault's emergency role), not submit
+        adapter.revoke(data);
+        assertEq(adapter.executableAt(data), 0);
+        vm.expectRevert(HyperCoreAdapter.DataNotTimelocked.selector);
+        adapter.setMaxGainBps(500);
+
+        vm.prank(curator);
+        adapter.submit(data);
+        vm.prank(curator);
+        adapter.revoke(data);
+        assertEq(adapter.executableAt(data), 0);
+
+        vm.prank(stranger);
+        vm.expectRevert(HyperCoreAdapter.NotCuratorOrSentinel.selector);
+        adapter.revoke(data);
+    }
+
+    function test_decreaseTimelock_waitsCurrentDuration() public {
+        bytes4 sel = HyperCoreAdapter.setMaxGainBps.selector;
+        _exec(abi.encodeCall(HyperCoreAdapter.increaseTimelock, (sel, 1 days)));
+
+        // Decreasing a timelock is delayed by the CURRENT duration of the target selector,
+        // so a compromised curator can't fast-track around a long lock.
+        bytes memory data = abi.encodeCall(HyperCoreAdapter.decreaseTimelock, (sel, 0));
+        vm.prank(curator);
+        adapter.submit(data);
+        assertEq(adapter.executableAt(data), block.timestamp + 1 days);
+
+        vm.expectRevert(HyperCoreAdapter.TimelockNotExpired.selector);
+        adapter.decreaseTimelock(sel, 0);
+
+        vm.warp(block.timestamp + 1 days);
+        adapter.decreaseTimelock(sel, 0);
+        assertEq(adapter.timelock(sel), 0);
+    }
+
+    function test_timelock_monotonicityChecks() public {
+        bytes4 sel = HyperCoreAdapter.setMaxGainBps.selector;
+        _exec(abi.encodeCall(HyperCoreAdapter.increaseTimelock, (sel, 1 days)));
+
+        bytes memory dec = abi.encodeCall(HyperCoreAdapter.increaseTimelock, (sel, 1 hours));
+        vm.prank(curator);
+        adapter.submit(dec);
+        vm.expectRevert(HyperCoreAdapter.TimelockNotIncreasing.selector);
+        adapter.increaseTimelock(sel, 1 hours);
+
+        bytes memory inc = abi.encodeCall(HyperCoreAdapter.decreaseTimelock, (sel, 2 days));
+        vm.prank(curator);
+        adapter.submit(inc);
+        vm.warp(block.timestamp + 1 days); // decreaseTimelock is itself delayed by 1 day
+        vm.expectRevert(HyperCoreAdapter.TimelockNotDecreasing.selector);
+        adapter.decreaseTimelock(sel, 2 days);
+    }
+
+    function test_timelock_decreaseSelectorNotManageable() public {
+        bytes4 dec = HyperCoreAdapter.decreaseTimelock.selector;
+        bytes memory data = abi.encodeCall(HyperCoreAdapter.increaseTimelock, (dec, 1 days));
+        vm.prank(curator);
+        adapter.submit(data);
+        vm.expectRevert(HyperCoreAdapter.AutomaticallyTimelocked.selector);
+        adapter.increaseTimelock(dec, 1 days);
+    }
+
+    function test_abdicate_disablesSelectorForever() public {
+        bytes4 sel = HyperCoreAdapter.setMaxGainBps.selector;
+        _exec(abi.encodeCall(HyperCoreAdapter.abdicate, (sel)));
+        assertTrue(adapter.abdicated(sel));
+
+        bytes memory data = abi.encodeCall(HyperCoreAdapter.setMaxGainBps, (500));
+        vm.prank(curator);
+        adapter.submit(data); // submit still possible, execution never
+        vm.expectRevert(HyperCoreAdapter.Abdicated.selector);
+        adapter.setMaxGainBps(500);
+    }
+
+    function test_revokeApiWallet_instantEvenWithTimelocks() public {
+        // Approve with a real 7-day lock in force, then revoke with zero delay.
+        _exec(abi.encodeCall(
+            HyperCoreAdapter.increaseTimelock, (HyperCoreAdapter.approveApiWallet.selector, 7 days)
+        ));
+        vm.prank(curator);
+        adapter.submit(abi.encodeCall(HyperCoreAdapter.approveApiWallet, (agent, "s")));
+        vm.warp(block.timestamp + 7 days);
+        adapter.approveApiWallet(agent, "s");
+        assertEq(adapter.apiWallet(), agent);
+
+        vm.prank(curator);
+        adapter.revokeApiWallet("s"); // the kill switch never waits
+        assertEq(adapter.apiWallet(), address(0));
+    }
+
+    /* ----------------------------- Session C: order guard -------------------------- */
+
+    function test_placeOrder_defaultDeny() public {
+        vm.prank(allocator);
+        vm.expectRevert(HyperCoreAdapter.AssetNotAllowed.selector);
+        adapter.placeOrder(42, true, 1e6, 1e6, false, HyperCoreActions.TIF_IOC, 0);
+    }
+
+    function test_orderGuard_sizeCap() public {
+        _exec(abi.encodeCall(HyperCoreAdapter.setOrderGuard, (uint32(0), uint64(100e8), uint16(0))));
+
+        vm.prank(allocator);
+        vm.expectRevert(HyperCoreAdapter.OrderSizeExceeded.selector);
+        adapter.placeOrder(0, true, 1e6, uint64(100e8) + 1, false, HyperCoreActions.TIF_IOC, 0);
+
+        vm.prank(allocator);
+        adapter.placeOrder(0, true, 1e6, uint64(100e8), false, HyperCoreActions.TIF_IOC, 0);
+    }
+
+    function test_orderGuard_priceBand_buy() public {
+        // Band 100 bps vs the book: buys anchor to the ASK (worst fill for a buy <= limitPx).
+        _exec(abi.encodeCall(
+            HyperCoreAdapter.setOrderGuard, (uint32(0), type(uint64).max, uint16(100))
+        ));
+        MockBbo(BBO).set(0.99e6, 1e6); // bid 0.99, ask 1.00
+
+        vm.prank(allocator);
+        vm.expectRevert(HyperCoreAdapter.PriceOutOfBand.selector);
+        adapter.placeOrder(0, true, 1.0101e6, 1e6, false, HyperCoreActions.TIF_IOC, 0); // > ask*1.01
+
+        vm.prank(allocator);
+        adapter.placeOrder(0, true, 1.01e6, 1e6, false, HyperCoreActions.TIF_IOC, 0); // == ask*1.01
+    }
+
+    function test_orderGuard_priceBand_sell() public {
+        _exec(abi.encodeCall(
+            HyperCoreAdapter.setOrderGuard, (uint32(0), type(uint64).max, uint16(100))
+        ));
+        MockBbo(BBO).set(1e6, 1.01e6); // bid 1.00 — sells anchor to the BID
+
+        vm.prank(allocator);
+        vm.expectRevert(HyperCoreAdapter.PriceOutOfBand.selector);
+        adapter.placeOrder(0, false, 0.9899e6, 1e6, false, HyperCoreActions.TIF_IOC, 0); // < bid*0.99
+
+        vm.prank(allocator);
+        adapter.placeOrder(0, false, 0.99e6, 1e6, false, HyperCoreActions.TIF_IOC, 0); // == bid*0.99
+    }
+
+    function test_orderGuard_bandDisabledAtZero() public {
+        _allowOrders(0); // band 0 = no book check (e.g. fork tests, illiquid config)
+        vm.prank(allocator);
+        adapter.placeOrder(0, true, type(uint64).max, 1e6, false, HyperCoreActions.TIF_IOC, 0);
+    }
+
+    function test_orderGuard_failsClosedOnEmptyBook() public {
+        _exec(abi.encodeCall(
+            HyperCoreAdapter.setOrderGuard, (uint32(0), type(uint64).max, uint16(100))
+        ));
+        MockBbo(BBO).set(0, 0); // empty book: nothing to anchor the band to
+        vm.prank(allocator);
+        vm.expectRevert(bytes("no ask"));
+        adapter.placeOrder(0, true, 1e6, 1e6, false, HyperCoreActions.TIF_IOC, 0);
+    }
+
+    function test_disallowOrders_instantKillSwitch() public {
+        _allowOrders(0);
+
+        vm.prank(allocator); // the guarded party can't lift its own constraints...
+        vm.expectRevert(HyperCoreAdapter.NotCuratorOrSentinel.selector);
+        adapter.disallowOrders(0);
+
+        vm.prank(sentinel); // ...but curator AND sentinel can slam the door instantly
+        adapter.disallowOrders(0);
+
+        vm.prank(allocator);
+        vm.expectRevert(HyperCoreAdapter.AssetNotAllowed.selector);
+        adapter.placeOrder(0, true, 1e6, 1e6, false, HyperCoreActions.TIF_IOC, 0);
+    }
+
+    function test_setOrderGuard_requiresTimelock() public {
+        vm.prank(curator);
+        vm.expectRevert(HyperCoreAdapter.DataNotTimelocked.selector);
+        adapter.setOrderGuard(0, type(uint64).max, 0);
     }
 }

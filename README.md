@@ -100,7 +100,15 @@ Hardening built in:
 - Self-expiring in-transit add-back so a deposit mid-bridge is never read as a loss.
 - Optional `maxGainBps` ceiling (curator-set, default off): caps the gain a single read may report
   above cost basis, blunting a one-block mark-price spike. Losses always pass through.
-- Config (`settleWindowBlocks`, `maxGainBps`) is curator-gated, not allocator-gated.
+- Trust-increasing config (`approveApiWallet`, `settleWindowBlocks`, `maxGainBps`,
+  `setOrderGuard`, `addTrackedToken`) routes through an **adapter-level timelock** mirroring
+  VaultV2's submit/execute/revoke system: the curator submits, anyone executes after the
+  per-selector delay, curator/sentinel revokes pending. Kill switches (`revokeApiWallet`,
+  `disallowOrders`, registry removals) are deliberately instant. Timelocks default to zero —
+  set them before adding the adapter to the vault.
+- On-chain `placeOrder` passes an order guard: default-deny per-asset whitelist, per-order size
+  cap, and a price band anchored to the live `bbo` (a limit buy fills ≤ limitPx, a sell ≥ limitPx,
+  so bounding limitPx against the opposite side bounds the worst fill).
 
 ## Still open (see PRODUCTION.md — the living tracker)
 
@@ -120,8 +128,11 @@ accounts — verified live ("Agent can only send asset to same user or their sub
 trade and shuffle funds within the adapter's spot/perp/sub-accounts (operationally handy: margin
 management without EVM txs). Exit to the vault still requires the allocator-gated
 bridge/deallocate paths, so the agent's blast radius is bad trades, not theft.
-`revokeApiWallet(name)` (allocator or curator) is the kill switch. On-chain
-`placeOrder`/`cancelOrder`/`transferUsdClass` remain as the trustless fallback.
+Approving an agent is the highest-trust action on the adapter, so it is **timelocked**
+(curator submits on the adapter, executable after the per-selector delay — depositors can exit
+before a new agent takes over); `revokeApiWallet(name)` (allocator, curator, or sentinel) is the
+instant kill switch. On-chain `placeOrder` (order-guarded) /`cancelOrder`/`transferUsdClass`
+remain as the trustless fallback.
 
 Proven live on testnet (2026-06-12, adapter `0x5a71C5A4DA2c6B5B32B91ef2b83B2d4aC28bFF8e`):
 
