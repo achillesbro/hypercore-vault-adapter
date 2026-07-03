@@ -107,10 +107,10 @@ discontinued). Verified live on the testnet adapter by flipping modes with the a
   funding flow (bridge → swap → trade) and the "USDC stuck in wrong class" failure mode.
   The 50k-actions/day cap is irrelevant at vault scale. (Docs recommend standard for
   builders mainly for that cap + builder-fee accrual, which we don't use.)
-- [ ] Multi-dex caveat (now sharper under unified): only `perpDex` is read by valuation;
-      USDT0 spot can collateralize USDT-margined HIP-3 dexes (e.g. CASH perps) under unified,
-      which would be INVISIBLE to `realAssets()`. Forbid via operator policy until multi-dex
-      margin reading lands — **Session B**
+- [x] Multi-dex margin reading — DONE (`valuation-hardening`): curator-registered
+      `extraPerpDexes` (bounded at 8) summed into valuation, floored at zero PER DEX so an
+      underwater dex can't optimistically offset another. Operator rule: register every dex
+      the agent may trade.
 - The testnet adapter `0x5a71…` now runs in unified mode (live reference).
 
 ### Underlying expansion (multi-asset vaults) — decision record (2026-07-03)
@@ -138,17 +138,19 @@ flows only. EXPANDED to non-stable underlyings — verified constants:
 
 ### realAssets() hardening — **Session B**
 
-- [ ] Multi-asset spot valuation: value non-USDC spot holdings on-chain via precompiles —
-      `spotPx` (0x0808), `markPx` (0x0806), `oraclePx` (0x0807), and **`bbo` (0x080e) for
-      order-book mid** ((bid+ask)/2). Off-chain cross-check via info endpoint `allMids`.
-      Decide the source hierarchy (oracle > mid > mark?) and haircut policy.
+- [x] Multi-asset spot valuation — DONE (`valuation-hardening`): curator-registered
+      `trackedTokens` (bounded at 8) valued at their USDC-pair **bbo BID** (sale side —
+      conservative for held assets; the ask is used for the USD→underlying leg, conservative
+      in that direction). Per-token `usdPerWeiScale` verified at registration
+      (= 10^weiDecimals * 10^(8-szDecimals) / 1e6). Empty balances skipped (no gas waste).
 - [x] Price the USDC↔underlying conversion in `realAssets()` — DONE: USD-denominated Core
       value (perp equity + spot USDC) is priced via the `bbo` precompile (0x080e) at the ASK
       of the UNDERLYING/USDC pair (conservative; fails closed on an empty book). Replaces the
       1:1 stable assumption and prices depeg risk. bbo raw px scaling verified on-chain:
       human px * 10^(8 - baseSzDecimals).
-- [ ] Open-markets registry: track which perps/spot pairs the account can hold so valuation
-      can enumerate and conservatively re-mark positions (mark vs oracle divergence)
+- [~] Open-markets registry: partially covered — the dex/token registries enumerate what
+      valuation reads; per-position oracle-vs-mark re-marking within a dex remains open
+      (accountValue is mark-based) — haircut policy if needed later
 - [ ] Confirm `accountMarginSummary.accountValue` semantics under isolated vs cross margin
 - [ ] Per-market `szDecimals`/`weiDecimals`/tick/lot verification for every market traded
       (read `tokenInfo`/`perpAssetInfo` precompiles; no hardcoding)

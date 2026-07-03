@@ -204,11 +204,11 @@ contract HyperEVMForkTest is Test {
 
         // Position now lives on perp (simulate: spot -> perp equity).
         MockSpotBalance(SPOT_BALANCE_PC).set(TRANSIT_TOKEN, 0, 0, 0);
-        MockAccountMargin(ACCOUNT_MARGIN_PC).set(int64(uint64(100_000e6)), 0, 0, 0);
+        MockAccountMargin(ACCOUNT_MARGIN_PC).set(0, int64(uint64(100_000e6)), 0, 0, 0);
         assertEq(adapter.realAssets(), 100_000e6);
 
         // Unwind: equity back to spot, bridge out, funds land on EVM, vault pulls them back.
-        MockAccountMargin(ACCOUNT_MARGIN_PC).set(0, 0, 0, 0);
+        MockAccountMargin(ACCOUNT_MARGIN_PC).set(0, 0, 0, 0, 0);
         MockSpotBalance(SPOT_BALANCE_PC).set(TRANSIT_TOKEN, uint64(100_000e6 * 100), 0, 0);
         vm.prank(allocator);
         adapter.bridgeToEvm(100_000e6); // queues spotSend on the real CoreWriter
@@ -234,7 +234,7 @@ contract HyperEVMForkTest is Test {
 
         // Settlement, then a 30% trading loss on the perp account.
         MockL1Block(L1_BLOCK_PC).set(1000 + SETTLE_WINDOW + 1);
-        MockAccountMargin(ACCOUNT_MARGIN_PC).set(int64(uint64(70_000e6)), 0, 0, 0);
+        MockAccountMargin(ACCOUNT_MARGIN_PC).set(0, int64(uint64(70_000e6)), 0, 0, 0);
 
         assertEq(adapter.realAssets(), 70_000e6);
         vault.accrueInterest();
