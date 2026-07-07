@@ -22,7 +22,8 @@
 - [x] Agent-wallet route: approveApiWallet/revokeApiWallet (action 9), live open/close via SDK,
       revocation kill switch verified ("API Wallet does not exist" post-revoke)
 - [x] Loss realization through real vault accounting (fork test, isolate mode)
-- [x] Operator tooling: `flow.py`, `agent_trade.py`, `accept_terms.py`, `check_core_state.py`
+- [x] Operator tooling: `flow.py`, `agent_trade.py`, `accept_terms.py`, `check_core_state.py`,
+      `probe_isolated_margin.py`, `probe_settlement_latency.py`
 - [x] Adapter-level timelock (VaultV2's submit system) on trust-increasing config + order guard
       on the placeOrder fallback (Session C, `timelock-guard`)
 - [x] Fuzz + invariant + adversarial suites on accounting/in-flight edges; HL-docs liquidation
@@ -155,7 +156,9 @@ flows only. EXPANDED to non-stable underlyings — verified constants:
 - [~] Open-markets registry: partially covered — the dex/token registries enumerate what
       valuation reads; per-position oracle-vs-mark re-marking within a dex remains open
       (accountValue is mark-based) — haircut policy if needed later
-- [ ] Confirm `accountMarginSummary.accountValue` semantics under isolated vs cross margin
+- [x] Confirm `accountMarginSummary.accountValue` semantics under isolated vs cross margin —
+      VERIFIED LIVE (2026-07-07): 0x080F = API `marginSummary` (isolated margin + uPnL
+      included), not `crossMarginSummary`. See loss-flow section for the probe data.
 - [ ] Per-market `szDecimals`/`weiDecimals`/tick/lot verification for every market traded
       (read `tokenInfo`/`perpAssetInfo` precompiles; no hardcoding)
 
@@ -176,11 +179,25 @@ maxRate gain cap (and maxGainBps if set), and it self-corrects at expiry — but
 reconciliation item below more attractive than pure time expiry, and argues for a TIGHT
 window over a generous one.
 
-- [ ] Measure real settlement latency distribution of the transit path (HIP-1 system-address
-      credits — observed seconds-fast on testnet probes, needs a distribution not anecdotes)
-- [ ] Set window = measured p99 + margin; document the residual mispricing bound
+- [x] Measure real settlement latency distribution — DONE on TESTNET (2026-07-07,
+      `probe_settlement_latency.py`, 60 probes of the exact adapter mechanism: native/HIP-1
+      transfer to the system address, credit observed via the spotBalance precompile,
+      latency stamped in L1 blocks like bridgeToCore does): upper-bound latency min 3 /
+      median 5 / **max 7 L1 blocks** (~0.26 s/block observed → credits land in ~1–2 s;
+      bounds include ±1–2 blocks of polling error). Quiet-market sample — REPEAT ON MAINNET
+      (and ideally under congestion) before setting the production window.
+- [x] Window calibration — deployed testnet window is 30 blocks: > 4x the max observed
+      latency, so no phantom-loss risk from early expiry; the cost is up to ~25 blocks
+      (~6 s) of double-count overstatement per bridge (see above), blunted by the vault's
+      maxRate gain cap. Kept at 30 deliberately: phantom loss passes through UNCAPPED while
+      the overstatement is capped, so the asymmetry favors a generous window until the
+      reconciliation below lands. Residual bound: NAV may overstate by the in-flight amount
+      for ≤ (30 − latency) blocks per bridge, and understates only if latency ever exceeds
+      30 blocks (never observed; margin 4x).
 - [ ] Consider reconciliation against the Core spot balance delta (the credit is observable
-      via the spotBalance precompile) instead of pure time expiry
+      via the spotBalance precompile) instead of pure time expiry — would eliminate the
+      double-count window entirely; attribution vs concurrent agent trades is the open
+      design question
 
 ### Withdrawals & liquidity — **resolved (design decision)**
 
@@ -220,15 +237,19 @@ through in full, gains are `maxRate`-capped).
       - Wedge check: spot `total` includes `hold` (funds locked by resting spot orders), and
         perp open-order margin sits inside accountValue — neither hides value from
         realAssets(). No wedging state found in the docs.
-      - STILL OPEN (docs don't specify): whether precompile 0x080F returns the API's
-        `marginSummary` (includes isolated margin + uPnL) or `crossMarginSummary` (cross
-        only). If cross-only, an isolated position's margin is INVISIBLE to valuation. Same
-        live probe as the tier-1 "accountValue semantics" item: open a tiny isolated position
-        on testnet, compare the precompile against both API summaries. Operator rule until
-        verified: the agent trades CROSS margin only.
+      - ~~STILL OPEN~~ **RESOLVED LIVE (2026-07-07, `probe_isolated_margin.py`)**: precompile
+        0x080F returns the API's `marginSummary`, isolated margin INCLUDED — with an isolated
+        0.0002 BTC position open on the adapter's account (agent-opened, unified mode),
+        precompile accountValue = 2.522381 = API marginSummary.accountValue while
+        crossMarginSummary read 0.0. No valuation hole: realAssets() sees isolated positions,
+        and the partition held (spot USDC 7.137→4.602 while accountValue rose 0→2.522; sum
+        conserved minus fees). Isolated positions are also REACHABLE under unified mode
+        (leverage update + open + close all accepted). The interim "agent trades cross-only"
+        restriction is LIFTED.
 - [ ] Testnet experiment: force a small liquidation on the adapter account (< 10k USDC so it
-      liquidates in one shot), observe `realAssets()`/share price through it; in the same
-      session run the isolated-vs-cross precompile probe above
+      liquidates in one shot), observe `realAssets()`/share price through it. Needs a real
+      adverse price move (or margin withdrawal to skate near maintenance) — timing not fully
+      controllable, so this stays a monitored live session.
 
 ## Tier 2 — trust model & governance
 
