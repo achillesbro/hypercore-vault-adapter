@@ -25,7 +25,9 @@
 - [x] Operator tooling: `flow.py`, `agent_trade.py`, `accept_terms.py`, `check_core_state.py`
 - [x] Adapter-level timelock (VaultV2's submit system) on trust-increasing config + order guard
       on the placeOrder fallback (Session C, `timelock-guard`)
-- [x] 49 unit tests + 8 mainnet-fork tests green
+- [x] Fuzz + invariant + adversarial suites on accounting/in-flight edges; HL-docs liquidation
+      research recorded (Session D, `loss-behavior-hardening`)
+- [x] 68 unit/fuzz/invariant tests + 8 mainnet-fork tests green
 
 Deployed (testnet, chainid 998): vault `0x84ec0fca475d13a7fd3af55b752c584f9791171f`,
 adapter v2 `0x5a71C5A4DA2c6B5B32B91ef2b83B2d4aC28bFF8e`,
@@ -165,6 +167,15 @@ shares cheap, NAV pops back); too long → a silently-failed deposit carries pha
 exiting depositors overpaid at remaining LPs' expense. Testnet already falsified one
 assumed bound.
 
+Sharpened by Session D's adversarial pass: the "too long" direction applies to SUCCESSFUL
+deposits too, not just failed ones — the add-back expires by AGE, so between the actual Core
+credit and window expiry the deposit is counted TWICE (spot + add-back), overstating NAV by
+the bridged amount for (window − latency) blocks. Pinned by
+`test_characterization_earlyCredit_doubleCountsUntilExpiry`. Blunted at the vault by the
+maxRate gain cap (and maxGainBps if set), and it self-corrects at expiry — but it makes the
+reconciliation item below more attractive than pure time expiry, and argues for a TIGHT
+window over a generous one.
+
 - [ ] Measure real settlement latency distribution of the transit path (HIP-1 system-address
       credits — observed seconds-fast on testnet probes, needs a distribution not anecdotes)
 - [ ] Set window = measured p99 + margin; document the residual mispricing bound
@@ -192,11 +203,32 @@ position loses / gets liquidated → `accountValue` drops → `realAssets()` dro
 **share price decreases at next `accrueInterest()`** (confirmed in fork test; losses pass
 through in full, gains are `maxRate`-capped).
 
-- [ ] Check HL docs: liquidation mechanics for the account (cross vs isolated), whether
-      `accountValue` can be negative post-liquidation (we floor at 0), and any state that
-      could wedge `realAssets()` (open orders' `hold`, isolated margin remnants)
-- [ ] Testnet experiment: force a small liquidation on the adapter account, observe
-      `realAssets()`/share price through it
+- [x] Check HL docs — DONE (`loss-behavior-hardening`, Session D). Findings:
+      - Cross liquidation triggers at accountValue < maintenance margin (= half of initial at
+        max leverage → 1.25%–16.7% of notional). First path: full-size market orders into the
+        book; remaining collateral stays with the account. Positions > 100k USDC (> 10k on
+        TESTNET) liquidate in 20% chunks with a 30s cooldown — size the testnet experiment
+        BELOW 10k so it liquidates in one shot.
+      - Backstop at < 2/3 maintenance: the liquidator vault takes over ALL cross positions AND
+        cross margin — the trader "ends up with zero account equity" (isolated backstop takes
+        only that position + its margin). Maintenance margin is NOT returned to the account.
+      - `accountValue` CAN go negative (ADL doc: "if a user's account value ... becomes
+        negative", the opposite side is then ADL'd at previous mark) → the zero-floor in
+        `_perpEquityUsd` is required, not just defensive; now fuzz-verified over the full
+        int64 range. A FLAT account can never be dragged negative (docs state the strict
+        invariant that a user with no open positions never socializes platform losses).
+      - Wedge check: spot `total` includes `hold` (funds locked by resting spot orders), and
+        perp open-order margin sits inside accountValue — neither hides value from
+        realAssets(). No wedging state found in the docs.
+      - STILL OPEN (docs don't specify): whether precompile 0x080F returns the API's
+        `marginSummary` (includes isolated margin + uPnL) or `crossMarginSummary` (cross
+        only). If cross-only, an isolated position's margin is INVISIBLE to valuation. Same
+        live probe as the tier-1 "accountValue semantics" item: open a tiny isolated position
+        on testnet, compare the precompile against both API summaries. Operator rule until
+        verified: the agent trades CROSS margin only.
+- [ ] Testnet experiment: force a small liquidation on the adapter account (< 10k USDC so it
+      liquidates in one shot), observe `realAssets()`/share price through it; in the same
+      session run the isolated-vs-cross precompile probe above
 
 ## Tier 2 — trust model & governance
 
@@ -226,8 +258,18 @@ through in full, gains are `maxRate`-capped).
 
 ## Tier 3 — testing, ops, deploy (after the contract stabilizes)
 
-- [ ] Fuzz/invariant tests on accounting + in-flight edges; adversarial tests (mark
-      manipulation, precompile-revert fails closed, reentrancy) — **Session D**
+- [x] Fuzz/invariant tests on accounting + in-flight edges; adversarial tests — DONE
+      (`loss-behavior-hardening`, Session D): fuzzed decimal seams (roundtrips exact, floors
+      never round up, out-of-range reverts), gain-ceiling properties (losses always pass),
+      bbo pricing (higher ask only shrinks NAV), in-flight accounting vs an explicit model;
+      invariant suite (4 × 128k calls, handler modeling Core settlement): funding ops
+      conserve NAV exactly, netDeposited mirrors vault flows, pendingHead bounded, add-back
+      never exceeds net deposits. Adversarial: every precompile failing → realAssets/bridge
+      fail closed (never fabricate), negative equity floored over full int64, dust-ask book
+      manipulation bounded by maxGainBps, early-credit double-count characterized (see
+      settlement window section). Reentrancy: no surface found — receive() is empty, the
+      underlying is a fixed known ERC20 (no hooks), vault-side flows are push-then-call /
+      call-then-pull; revisit only if a hooked underlying is ever considered.
 - [ ] Full testnet round-trip with REAL Core settlement once Session A lands — **Session D**
 - [ ] Monitoring: `realAssets()` deviation alerts, agent activity watch, pending-bridge
       reconciliation; decide if `pruneSettled` needs a keeper
